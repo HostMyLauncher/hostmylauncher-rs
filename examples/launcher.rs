@@ -1,0 +1,57 @@
+//! Demo: list instances, resolve by code, fetch files, and stream real-time events.
+//!
+//! Run against a local stackedhost-d1:
+//!   SH_BASE=http://localhost:8787 SH_LAUNCHER=lns SH_CODE=SECRET \
+//!     cargo run --example launcher
+
+use std::time::Duration;
+
+use futures::StreamExt;
+use stackedhost_sdk::{Client, ConnectOpts, ListOpts};
+
+#[tokio::main]
+async fn main() -> stackedhost_sdk::Result<()> {
+    let base = std::env::var("SH_BASE").unwrap_or_else(|_| "http://localhost:8787".into());
+    let launcher = std::env::var("SH_LAUNCHER").unwrap_or_else(|_| "lns".into());
+    let client = Client::new(&base)?;
+
+    let instances = client.list_instances(&launcher, &ListOpts::default()).await?;
+    println!("instances ({}):", instances.len());
+    for i in &instances {
+        println!("  - {} [{}]", i.title.clone().unwrap_or_default(), i.id);
+    }
+
+    if let Ok(code) = std::env::var("SH_CODE") {
+        match client.resolve_by_code(&launcher, &code).await {
+            Ok(inst) => {
+                println!(
+                    "resolved by code: {} [{}] hidden={:?}",
+                    inst.title.clone().unwrap_or_default(),
+                    inst.id,
+                    inst.hide
+                );
+                let files = client
+                    .get_instance_files(&launcher, &inst.id, Some(&code))
+                    .await
+                    .unwrap_or_default();
+                println!("  files: {}", files.len());
+            }
+            Err(e) => println!("resolve_by_code error: {e}"),
+        }
+    }
+
+    println!("listening for real-time events (30s)...");
+    let mut rt = client.connect(&launcher, ConnectOpts::default());
+    let timeout = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => { println!("done."); break; }
+            ev = rt.next() => match ev {
+                Some(ev) => println!("event: {ev:?}"),
+                None => { println!("stream ended."); break; }
+            },
+        }
+    }
+    Ok(())
+}
