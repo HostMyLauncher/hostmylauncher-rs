@@ -1,5 +1,5 @@
+use hostmylauncher::{Event, Instance, RemoteFile, SyncMode};
 use serde_json::json;
-use stackedhost_sdk::{Event, Instance, RemoteFile, SyncMode};
 
 #[test]
 fn deserializes_instance_with_nested_and_extra() {

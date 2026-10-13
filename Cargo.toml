@@ -1,17 +1,17 @@
 [package]
-name = "stackedhost-sdk"
+name = "hostmylauncher"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Async Rust client (REST + WebSocket) for the StackedHost launcher API (stackedhost-d1)."
-repository = "https://github.com/fitzxel/stackedhost-sdk"
-keywords = ["stackedhost", "minecraft", "launcher", "websocket", "sdk"]
+description = "Async Rust client (REST + WebSocket) for the HostMyLauncher launcher API."
+repository = "https://github.com/HostMyLauncher/hostmylauncher-rs"
+keywords = ["hostmylauncher", "minecraft", "launcher", "websocket", "client"]
 categories = ["api-bindings", "web-programming"]
 
 [features]
 default = ["download"]
 # File download with SHA-1/SHA-512 + size verification.
-download = ["dep:sha1", "dep:sha2", "dep:hex", "tokio/fs", "tokio/io-util", "reqwest/stream"]
+download = ["dep:sha1", "dep:sha2", "dep:hex", "dep:tempfile", "dep:zip", "tokio/fs", "tokio/io-util", "reqwest/stream"]
 # High-level InstanceWatcher that keeps a live, reconciled instance list.
 watch = []
 
@@ -30,6 +30,8 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 sha1 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
+tempfile = { version = "3", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

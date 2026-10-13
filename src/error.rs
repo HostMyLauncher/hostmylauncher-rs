@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Errors returned by the SDK.
+/// Errors returned by the client.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("http error: {0}")]

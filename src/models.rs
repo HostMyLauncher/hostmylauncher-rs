@@ -1,4 +1,4 @@
-//! Typed models for the StackedHost API. Fields are tolerant (`Option`,
+//! Typed models for the HostMyLauncher API. Fields are tolerant (`Option`,
 //! `#[serde(default)]`) because `files`/`data` are flexible JSON.
 
 use serde::{Deserialize, Serialize};
@@ -187,7 +187,7 @@ pub enum Event {
     LauncherDeleted {
         revision: u64,
     },
-    /// Any event type the SDK does not specifically model.
+    /// Any event type the client does not specifically model.
     Other(RawEvent),
 }
 

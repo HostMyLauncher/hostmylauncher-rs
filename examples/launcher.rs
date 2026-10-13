@@ -1,27 +1,32 @@
 //! Demo: list instances, resolve by code, fetch files, and stream real-time events.
 //!
-//! Run against a local stackedhost-d1:
-//!   SH_BASE=http://localhost:8787 SH_LAUNCHER=lns SH_CODE=SECRET \
+//! Run against a local HostMyLauncher API:
+//!   HML_BASE_URL=http://localhost:8787 HML_LAUNCHER_ID=lns HML_ACCESS_CODE=SECRET \
 //!     cargo run --example launcher
 
 use std::time::Duration;
 
 use futures::StreamExt;
-use stackedhost_sdk::{Client, ConnectOpts, ListOpts};
+use hostmylauncher::{Client, ConnectOpts, ListOpts};
 
 #[tokio::main]
-async fn main() -> stackedhost_sdk::Result<()> {
-    let base = std::env::var("SH_BASE").unwrap_or_else(|_| "http://localhost:8787".into());
-    let launcher = std::env::var("SH_LAUNCHER").unwrap_or_else(|_| "lns".into());
-    let client = Client::new(&base)?;
+async fn main() -> hostmylauncher::Result<()> {
+    let launcher = std::env::var("HML_LAUNCHER_ID").unwrap_or_else(|_| "lns".into());
+    let client = match std::env::var("HML_BASE_URL") {
+        Ok(base_url) => Client::with_base_url(&base_url)?,
+        Err(std::env::VarError::NotPresent) => Client::new(),
+        Err(error) => return Err(hostmylauncher::Error::Other(error.to_string())),
+    };
 
-    let instances = client.list_instances(&launcher, &ListOpts::default()).await?;
+    let instances = client
+        .list_instances(&launcher, &ListOpts::default())
+        .await?;
     println!("instances ({}):", instances.len());
     for i in &instances {
         println!("  - {} [{}]", i.title.clone().unwrap_or_default(), i.id);
     }
 
-    if let Ok(code) = std::env::var("SH_CODE") {
+    if let Ok(code) = std::env::var("HML_ACCESS_CODE") {
         match client.resolve_by_code(&launcher, &code).await {
             Ok(inst) => {
                 println!(

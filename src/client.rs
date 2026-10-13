@@ -5,7 +5,7 @@ use url::Url;
 use crate::error::{Error, Result};
 use crate::models::{Instance, ListOpts, News, RemoteFile};
 
-/// Client for the StackedHost REST API. Cheap to clone (shares the inner
+/// Client for the HostMyLauncher REST API. Cheap to clone (shares the inner
 /// `reqwest::Client` connection pool).
 #[derive(Clone)]
 pub struct Client {
@@ -15,9 +15,16 @@ pub struct Client {
 }
 
 impl Client {
-    /// Creates a client for the given base URL (e.g. `https://api.example.com`
-    /// or `http://localhost:8787`).
-    pub fn new(base_url: &str) -> Result<Self> {
+    /// Creates a client for the production API at `https://api.hostmylauncher.com`.
+    /// Use [`Self::with_base_url`] to connect to another server.
+    pub fn new() -> Self {
+        Self::with_base_url("https://api.hostmylauncher.com")
+            .expect("the production API URL must be valid")
+    }
+
+    /// Creates a client for a custom base URL (e.g. `http://localhost:8787`).
+    /// Returns an error if the URL cannot be parsed.
+    pub fn with_base_url(base_url: &str) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::new(),
             base: Url::parse(base_url)?,
@@ -82,7 +89,11 @@ impl Client {
 
     /// Lists the visible instances of a launcher (public projection unless the
     /// client is authenticated as a member/admin/owner).
-    pub async fn list_instances(&self, launcher_id: &str, opts: &ListOpts) -> Result<Vec<Instance>> {
+    pub async fn list_instances(
+        &self,
+        launcher_id: &str,
+        opts: &ListOpts,
+    ) -> Result<Vec<Instance>> {
         let mut q: Vec<(&str, String)> = Vec::new();
         if let Some(v) = opts.limit {
             q.push(("limit", v.to_string()));
@@ -96,14 +107,19 @@ impl Client {
         if let Some(v) = &opts.order {
             q.push(("order", v.clone()));
         }
-        let body = self.get(&format!("/launchers/{launcher_id}/instances"), &q).await?;
+        let body = self
+            .get(&format!("/launchers/{launcher_id}/instances"), &q)
+            .await?;
         take_results(body)
     }
 
     /// Fetches a single instance of a launcher by id or slug.
     pub async fn get_instance(&self, launcher_id: &str, id_or_slug: &str) -> Result<Instance> {
         let body = self
-            .get(&format!("/launchers/{launcher_id}/instances/{id_or_slug}"), &[])
+            .get(
+                &format!("/launchers/{launcher_id}/instances/{id_or_slug}"),
+                &[],
+            )
             .await?;
         take_data(body)
     }
@@ -139,7 +155,10 @@ impl Client {
             None => vec![],
         };
         let body = self
-            .get(&format!("/launchers/{launcher_id}/instances/{id}/files"), &q)
+            .get(
+                &format!("/launchers/{launcher_id}/instances/{id}/files"),
+                &q,
+            )
             .await?;
         take_results(body)
     }
@@ -147,7 +166,10 @@ impl Client {
     /// Registers a download, returning the new total count.
     pub async fn increment_downloads(&self, id: &str) -> Result<u64> {
         let body = self
-            .send(self.http.post(self.build_url(&format!("/instances/{id}/downloads"), &[])))
+            .send(
+                self.http
+                    .post(self.build_url(&format!("/instances/{id}/downloads"), &[])),
+            )
             .await?;
         Ok(body
             .get("data")
@@ -160,8 +182,16 @@ impl Client {
 
     /// Lists a launcher's news (published only for public callers).
     pub async fn list_news(&self, launcher_id: &str) -> Result<Vec<News>> {
-        let body = self.get(&format!("/launchers/{launcher_id}/news"), &[]).await?;
+        let body = self
+            .get(&format!("/launchers/{launcher_id}/news"), &[])
+            .await?;
         take_results(body)
+    }
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
