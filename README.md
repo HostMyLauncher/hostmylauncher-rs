@@ -29,8 +29,8 @@ async fn main() -> hostmylauncher::Result<()> {
     // Catalog
     let instances = client.list_instances("lns", &ListOpts::default()).await?;
 
-    // "Enter code" flow → instance + files (works for hidden/locked too)
-    let inst = client.resolve_by_code("lns", "SECRET").await?;
+    // "Enter code" flow → public instance, then files (hidden/locked too)
+    let inst = client.resolve_by_code(&["lns"], "SECRET").await?;
     let files = client.get_instance_files("lns", &inst.id, Some("SECRET")).await?;
     for f in &files {
         if f.path.as_deref() == Some("overrides.zip") {
@@ -60,6 +60,30 @@ async fn main() -> hostmylauncher::Result<()> {
     Ok(())
 }
 ```
+
+## Resolve an access code
+
+```rust,no_run
+# async fn example() -> hostmylauncher::Result<()> {
+let client = hostmylauncher::Client::new();
+let instance = client.resolve_by_code(&["launcher-a", "launcher-b"], "SECRET").await?;
+let launcher_id = instance.launcher_id.as_deref().expect("resolver returns launcher_id");
+let files = client.get_instance_files(launcher_id, &instance.id, Some("SECRET")).await?;
+# Ok(())
+# }
+```
+
+`resolve_by_code` sends `POST /instances/resolve` with JSON `code` and `launcher_ids`;
+it no longer uses the launcher-scoped GET resolver. Supply 1–20 known launcher IDs.
+The response always contains public fields only, even with a bearer token or for a hidden
+instance. Fetch files separately with the returned launcher ID and original code.
+
+The API rejects ambiguous matches with `409`, and persists attempt quotas in D1 across
+requests and restarts: 30 attempts/IP and 120 attempts/launcher per 60-second window.
+Temporary blocks return `429 Too Many Requests` and an HTTP `Retry-After` header.
+The SDK propagates `409`, `429`, and protection failures (`503`) as `Error::Api` and does
+not retry automatically; the current error type does not expose response headers.
+Launcher IDs restrict the search, but are not themselves an authorization credential.
 
 ## Instance synchronization safety
 

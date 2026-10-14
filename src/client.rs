@@ -130,13 +130,17 @@ impl Client {
         take_data(body)
     }
 
-    /// Resolves an instance by its access code (the code grants access, so this
-    /// returns the full instance even when hidden). Powers the "enter code" flow.
-    pub async fn resolve_by_code(&self, launcher_id: &str, code: &str) -> Result<Instance> {
+    /// Resolves an access code only among the supplied launcher IDs (1–20).
+    /// Returns public fields even for hidden instances and authenticated callers.
+    /// Fetch files separately with the returned launcher ID and the original code.
+    /// Ambiguity (409), throttling (429), and protection failure (503) are
+    /// returned as [`Error::Api`]; this method never retries automatically.
+    pub async fn resolve_by_code(&self, launcher_ids: &[&str], code: &str) -> Result<Instance> {
         let body = self
-            .get(
-                &format!("/launchers/{launcher_id}/instances/resolve"),
-                &[("code", code.to_string())],
+            .send(
+                self.http
+                    .post(self.build_url("/instances/resolve", &[]))
+                    .json(&serde_json::json!({ "code": code, "launcher_ids": launcher_ids })),
             )
             .await?;
         take_data(body)

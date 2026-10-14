@@ -14,7 +14,7 @@
 //! use hostmylauncher::{Client, ListOpts};
 //! let client = Client::new();
 //! let instances = client.list_instances("lns", &ListOpts::default()).await?;
-//! let instance = client.resolve_by_code("lns", "SECRET").await?;
+//! let instance = client.resolve_by_code(&["lns"], "SECRET").await?;
 //! let files = client.get_instance_files("lns", &instance.id, Some("SECRET")).await?;
 //! # let _ = (instances, files);
 //! # Ok(())

@@ -23,7 +23,7 @@ pub struct Instance {
     pub loader: Option<Loader>,
     #[serde(default)]
     pub locked: bool,
-    /// Only present for authenticated/code-resolved reads.
+    /// Only present for full authenticated reads, never code resolution.
     #[serde(default)]
     pub hide: Option<bool>,
     #[serde(default)]
@@ -43,7 +43,8 @@ pub struct Instance {
     pub animation: Option<String>,
     #[serde(default)]
     pub downloads: u64,
-    /// Present on full reads (authenticated / code-resolved / `/files`).
+    /// Present on full authenticated reads; code resolution omits files.
+    /// Fetch downloads separately through the `/files` endpoint.
     #[serde(default)]
     pub files: Option<Vec<RemoteFile>>,
     /// Any additional fields (e.g. `code`, `created_at`, `updated_at`).

@@ -27,16 +27,19 @@ async fn main() -> hostmylauncher::Result<()> {
     }
 
     if let Ok(code) = std::env::var("HML_ACCESS_CODE") {
-        match client.resolve_by_code(&launcher, &code).await {
+        match client.resolve_by_code(&[launcher.as_str()], &code).await {
             Ok(inst) => {
                 println!(
-                    "resolved by code: {} [{}] hidden={:?}",
+                    "resolved public instance: {} [{}]",
                     inst.title.clone().unwrap_or_default(),
-                    inst.id,
-                    inst.hide
+                    inst.id
                 );
                 let files = client
-                    .get_instance_files(&launcher, &inst.id, Some(&code))
+                    .get_instance_files(
+                        inst.launcher_id.as_deref().expect("resolver returns launcher_id"),
+                        &inst.id,
+                        Some(&code),
+                    )
                     .await
                     .unwrap_or_default();
                 println!("  files: {}", files.len());
