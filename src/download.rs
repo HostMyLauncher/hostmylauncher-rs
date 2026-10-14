@@ -92,8 +92,12 @@ impl Client {
     ///
     /// Only paths recorded by the previous manifest are eligible for removal.
     /// If a user changed one of those files, it is preserved rather than
-    /// silently deleted. The manifest is replaced only after all downloads,
-    /// extraction, and filesystem changes succeed.
+    /// silently deleted. Override updates are compared with the new content.
+    /// Destination parents must be real directories, not symlinks. Changes are
+    /// backed up and rolled back if installation, removal, or manifest saving
+    /// fails. If rollback itself fails, the error identifies retained backups.
+    /// This is error recovery, not crash atomicity: callers must prevent other
+    /// processes from modifying the destination during synchronization.
     pub async fn sync_instance_files<F>(
         &self,
         files: &[RemoteFile],
@@ -107,6 +111,8 @@ impl Client {
         tokio::fs::create_dir_all(destination).await?;
         let root = std::fs::canonicalize(destination)?;
         let previous = load_manifest(manifest_path)?;
+        // The manifest is control state, never an installable instance asset.
+        let manifest_target = manifest_output_target(manifest_path)?;
         let mut regular = BTreeMap::new();
         let mut overrides = None;
         for file in files {
@@ -136,6 +142,8 @@ impl Client {
         let mut downloaded = 0;
         for (index, (path, file)) in regular.iter().enumerate() {
             let target = root.join(path);
+            reject_manifest_conflict(&target, &manifest_target)?;
+            validate_file_target(&target, &root)?;
             let unchanged = previous
                 .files
                 .get(path.to_string_lossy().as_ref())
@@ -210,12 +218,11 @@ impl Client {
                     },
                 )
                 .await?;
+                reject_manifest_conflict(&target, &manifest_target)?;
+                validate_file_target(&target, &root)?;
+                let unchanged = current_manifest_matches(&target, &entry)?;
                 desired.insert(relative.to_string_lossy().into_owned(), entry);
-                if !previous
-                    .files
-                    .get(relative.to_string_lossy().as_ref())
-                    .is_some_and(|old| current_manifest_matches(&target, old).unwrap_or(false))
-                {
+                if !unchanged {
                     staged_files.push((relative, staged));
                 }
             }
@@ -227,31 +234,29 @@ impl Client {
             ));
         }
 
-        for (path, staged) in staged_files {
-            let target = root.join(&path);
-            if let Some(parent) = target.parent() {
-                ensure_real_directory(parent, &root)?;
-            }
-            replace_regular_file(&staged, &target)?;
-        }
-
-        let mut removed = 0;
+        let mut obsolete = Vec::new();
         for (path, old) in &previous.files {
             if desired.contains_key(path) {
                 continue;
             }
             let target = root.join(safe_entry_path(path)?);
-            if current_manifest_matches(&target, old)? {
-                if std::fs::symlink_metadata(&target)
-                    .map(|m| m.file_type().is_file())
-                    .unwrap_or(false)
-                {
-                    std::fs::remove_file(target)?;
-                    removed += 1;
-                }
+            reject_manifest_conflict(&target, &manifest_target)?;
+            validate_real_directory(target.parent().expect("rooted file has a parent"), &root)?;
+            // Inspect the final component before hashing: never follow a stale
+            // file symlink, even if it points to content matching the manifest.
+            if std::fs::symlink_metadata(&target)
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false)
+                && current_manifest_matches(&target, old)?
+            {
+                obsolete.push(target);
             }
         }
-        save_manifest(
+        let removed = obsolete.len();
+        apply_sync_changes(
+            &root,
+            staged_files,
+            obsolete,
             manifest_path,
             &SyncManifest {
                 version: 1,
@@ -453,6 +458,113 @@ fn collect_files_inner(root: &Path, current: &Path, files: &mut Vec<PathBuf>) ->
     Ok(())
 }
 
+struct PreparedChange {
+    target: PathBuf,
+    staged: Option<PathBuf>,
+    backup: Option<PathBuf>,
+}
+
+/// Applies a prepared batch, keeping originals until the manifest is committed.
+/// Backup copies leave installed files in place until their atomic replacement.
+fn apply_sync_changes(
+    root: &Path,
+    installs: Vec<(PathBuf, PathBuf)>,
+    obsolete: Vec<PathBuf>,
+    manifest_path: &Path,
+    manifest: &SyncManifest,
+) -> Result<()> {
+    let backups = tempfile::tempdir_in(root)?;
+    let mut changes = Vec::new();
+    let operations = installs
+        .into_iter()
+        .map(|(path, staged)| (root.join(path), Some(staged)))
+        .chain(obsolete.into_iter().map(|path| (path, None)));
+    for (index, (target, staged)) in operations.enumerate() {
+        validate_file_target(&target, root)?;
+        let backup = match std::fs::symlink_metadata(&target) {
+            Ok(_) => {
+                let backup = backups.path().join(index.to_string());
+                std::fs::copy(&target, &backup)?;
+                Some(backup)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        changes.push(PreparedChange {
+            target,
+            staged,
+            backup,
+        });
+    }
+
+    let mut applied = Vec::new();
+    let mut created = Vec::new();
+    let result = (|| -> Result<()> {
+        for (index, change) in changes.iter().enumerate() {
+            let parent = change.target.parent().expect("rooted file has a parent");
+            create_real_directory(parent, root, &mut created)?;
+            validate_file_target(&change.target, root)?;
+            if let Some(staged) = &change.staged {
+                replace_regular_file(staged, &change.target)?;
+            } else {
+                std::fs::remove_file(&change.target)?;
+            }
+            applied.push(index);
+        }
+        save_manifest(manifest_path, manifest)
+    })();
+
+    if let Err(error) = result {
+        return Err(rollback_sync_changes(
+            error, root, &changes, &applied, &created, backups,
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_sync_changes(
+    error: Error,
+    root: &Path,
+    changes: &[PreparedChange],
+    applied: &[usize],
+    created: &[PathBuf],
+    backups: tempfile::TempDir,
+) -> Error {
+    let mut failures = Vec::new();
+    for &index in applied.iter().rev() {
+        let change = &changes[index];
+        let restored = (|| -> Result<()> {
+            validate_file_target(&change.target, root)?;
+            if let Some(backup) = &change.backup {
+                replace_regular_file(backup, &change.target)?;
+            } else {
+                std::fs::remove_file(&change.target)?;
+            }
+            Ok(())
+        })();
+        if let Err(rollback_error) = restored {
+            failures.push(format!("{}: {rollback_error}", change.target.display()));
+        }
+    }
+    for directory in created.iter().rev() {
+        let removed = validate_real_directory(directory, root)
+            .and_then(|_| std::fs::remove_dir(directory).map_err(Error::from));
+        if let Err(rollback_error) = removed {
+            failures.push(format!("{}: {rollback_error}", directory.display()));
+        }
+    }
+    if !failures.is_empty() {
+        // Never discard the only remaining originals after failed recovery.
+        let retained = backups.keep();
+        return Error::Other(format!(
+            "sync failed: {error}; rollback failed: {}; backups retained at {}",
+            failures.join("; "),
+            retained.display()
+        ));
+    }
+    error
+}
+
 fn replace_regular_file(staged: &Path, target: &Path) -> Result<()> {
     if let Ok(metadata) = std::fs::symlink_metadata(target) {
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -461,8 +573,9 @@ fn replace_regular_file(staged: &Path, target: &Path) -> Result<()> {
                 target.display()
             )));
         }
-        std::fs::remove_file(target)?;
     }
+    // Rename replaces an existing regular target without deleting it first.
+    // If it fails, the previous file is still present.
     std::fs::rename(staged, target)?;
     Ok(())
 }
@@ -564,17 +677,15 @@ pub fn extract_overrides(archive_path: &Path, destination: &Path) -> Result<()> 
         if let Some(parent) = output.parent() {
             ensure_real_directory(parent, &root)?;
         }
-        if output.exists() || std::fs::symlink_metadata(&output).is_ok() {
-            let metadata = std::fs::symlink_metadata(&output)?;
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        if let Ok(metadata) = std::fs::symlink_metadata(&output) {
+            if !metadata.file_type().is_file() {
                 return Err(Error::Other(format!(
                     "unsafe existing override path: {}",
                     entry.name()
                 )));
             }
-            std::fs::remove_file(&output)?;
         }
-        std::fs::rename(staged, output)?;
+        replace_regular_file(&staged, &output)?;
     }
     Ok(())
 }
@@ -597,19 +708,123 @@ fn safe_entry_path(name: &str) -> Result<PathBuf> {
     Ok(safe)
 }
 
-fn ensure_real_directory(path: &Path, root: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    let canonical = std::fs::canonicalize(path)?;
-    if !canonical.starts_with(root) {
+/// Validates every existing parent without creating anything or following links.
+/// Missing suffixes are allowed; creation happens only after this whole check.
+fn validate_real_directory(path: &Path, root: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| Error::Other("override destination escapes root".into()))?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
         return Err(Error::Other("override destination escapes root".into()));
     }
+    let mut current = root.to_path_buf();
+    check_directory_component(&current, root)?;
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(Error::Other("override destination escapes root".into()));
+        }
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => check_directory_component(&current, root)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn check_directory_component(path: &Path, root: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(Error::Other(
             "override destination contains a symlink or non-directory".into(),
         ));
     }
+    if !std::fs::canonicalize(path)?.starts_with(root) {
+        return Err(Error::Other("override destination escapes root".into()));
+    }
     Ok(())
+}
+
+/// Resolve existing parent aliases and normalize missing suffixes, including
+/// `..`. Do not resolve the final component: persist replaces that entry itself.
+fn manifest_output_target(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| Error::Other("manifest has no filename".into()))?;
+    let mut parent = PathBuf::new();
+    for component in absolute
+        .parent()
+        .expect("absolute file has a parent")
+        .components()
+    {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parent.pop();
+            }
+            _ => {
+                parent.push(component);
+                if let Ok(canonical) = std::fs::canonicalize(&parent) {
+                    parent = canonical;
+                }
+            }
+        }
+    }
+    Ok(parent.join(name))
+}
+
+fn reject_manifest_conflict(target: &Path, manifest_target: &Path) -> Result<()> {
+    if target == manifest_target {
+        return Err(Error::Other(
+            "instance file conflicts with manifest path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_file_target(target: &Path, root: &Path) -> Result<()> {
+    validate_real_directory(target.parent().expect("rooted file has a parent"), root)?;
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(Error::Other(format!(
+            "unsafe existing target: {}",
+            target.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_real_directory(path: &Path, root: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
+    validate_real_directory(path, root)?;
+    let mut current = root.to_path_buf();
+    for component in path
+        .strip_prefix(root)
+        .expect("validated path")
+        .components()
+    {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => check_directory_component(&current, root)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // The parent was checked before each individual creation.
+                std::fs::create_dir(&current)?;
+                created.push(current.clone());
+                check_directory_component(&current, root)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path, root: &Path) -> Result<()> {
+    create_real_directory(path, root, &mut Vec::new())
 }
 
 #[cfg(test)]
@@ -668,6 +883,61 @@ mod tests {
             sha512: hex::encode(Sha512::digest(b"managed content")),
         };
         assert!(!current_manifest_matches(&path, &old).unwrap());
+    }
+
+    // A missing staged source deterministically forces rename to fail.
+    #[test]
+    fn failed_replacement_preserves_previous_file() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let target = sandbox.path().join("installed.txt");
+        let staged = sandbox.path().join("missing-staged.txt");
+        std::fs::write(&target, b"previous content").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous content");
+        assert!(!staged.exists());
+
+        let error = replace_regular_file(&staged, &target).unwrap_err();
+        match error {
+            Error::Io(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            error => panic!("expected rename I/O failure, got {error}"),
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous content");
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read_dir(sandbox.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rollback_failure_reports_error_and_retains_original_backup() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(sandbox.path()).unwrap();
+        let target = root.join("installed.txt");
+        // Simulate a filesystem state that cannot safely be restored.
+        std::fs::create_dir(&target).unwrap();
+        let backups = tempfile::tempdir_in(&root).unwrap();
+        let retained = backups.path().to_path_buf();
+        let original = retained.join("0");
+        std::fs::write(&original, b"previous content").unwrap();
+        let changes = [PreparedChange {
+            target: target.clone(),
+            staged: None,
+            backup: Some(original.clone()),
+        }];
+
+        let error = rollback_sync_changes(
+            Error::Other("installation failed".into()),
+            &root,
+            &changes,
+            &[0],
+            &[],
+            backups,
+        );
+        assert_eq!(error.to_string(), format!(
+            "sync failed: installation failed; rollback failed: {}: unsafe existing target: {}; backups retained at {}",
+            target.display(), target.display(), retained.display()
+        ));
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&original).unwrap(), b"previous content");
+        assert_eq!(std::fs::read_dir(&retained).unwrap().count(), 1);
     }
 
     #[test]

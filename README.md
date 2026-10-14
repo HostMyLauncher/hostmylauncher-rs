@@ -61,6 +61,34 @@ async fn main() -> hostmylauncher::Result<()> {
 }
 ```
 
+## Instance synchronization safety
+
+`sync_instance_files` verifies downloads in staging, installs changed overrides
+on the first sync, and removes only unchanged files owned by the previous
+manifest. User-modified obsolete files and final-component symlinks are preserved.
+Existing symlinks in destination parent directories are rejected before hashing,
+creating directories, or deleting files. A remote asset cannot use the manifest's
+output path (`instance file conflicts with manifest path`).
+
+Before applying a batch, the synchronizer backs up existing files inside the
+instance directory. Replacements use rename without first deleting the installed
+file. An installation, removal, or manifest-save error triggers rollback of
+applied files and newly created instance subdirectories. The manifest is written
+last using a temporary file and rename. Allow enough free space for staging and
+backup copies of replaced or removed files.
+
+This provides recovery from returned filesystem errors, **not crash-atomic or
+concurrent synchronization**. The caller must ensure exclusive access to the
+instance and manifest while syncing. A process crash or power loss can interrupt
+application. If rollback itself fails, the returned error includes
+`rollback failed` and the retained backup directory; preserve it for manual
+recovery. The destination root may remain created after a failed first sync, and
+parent directories for a caller-selected external manifest are not rolled back.
+`download_overrides` alone does not provide batch rollback.
+
+Run the regression tests with `cargo test --offline --lib --test sync_reproductions`.
+Symlink tests run on Unix only.
+
 ## Features
 
 | Feature    | Default | Adds                                                |
