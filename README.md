@@ -87,8 +87,23 @@ Launcher IDs restrict the search, but are not themselves an authorization creden
 
 ## Instance synchronization safety
 
-`sync_instance_files` verifies downloads in staging, installs changed overrides
-on the first sync, and removes only unchanged files owned by the previous
+`sync_instance_files` compares provider content with the saved manifest, not
+with the current installed contents. Regular files with unchanged remote size
+and hashes reuse their previous manifest entries without reading local contents;
+local edits and missing files are left as-is. If remote hashes are absent, the
+file is downloaded and verified in staging, then compared with the previous
+manifest before deciding whether to install it. Size alone cannot prove that
+provider content is unchanged. `SyncReport.downloaded` counts these downloads,
+even when no replacement is necessary.
+
+`overrides.zip` is downloaded and verified on each sync. Extracted entries are
+compared with the previous manifest, not the installed files: unchanged provider
+entries preserve local edits and missing files, while changed or new entries
+are installed. The manifest continues to describe provider content. Sync is not
+an integrity audit or repair operation.
+
+All new downloads are verified in staging. The synchronizer installs overrides
+on the first sync and removes only unchanged files owned by the previous
 manifest. User-modified obsolete files and final-component symlinks are preserved.
 Existing symlinks in destination parent directories are rejected before hashing,
 creating directories, or deleting files. A remote asset cannot use the manifest's

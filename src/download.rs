@@ -88,7 +88,12 @@ impl Client {
         Ok(())
     }
 
-    /// Synchronizes an instance manifest into `destination`.
+    /// Synchronizes provider changes into `destination`, not local divergence.
+    /// Unchanged remote size and hashes reuse the previous manifest entry without
+    /// reading local contents, preserving local edits and missing files. Without
+    /// remote hashes, verified staged downloads are compared to the manifest.
+    /// Overrides are downloaded and compared to previous provider entries too.
+    /// This is not an integrity audit or repair operation.
     ///
     /// Only paths recorded by the previous manifest are eligible for removal.
     /// If a user changed one of those files, it is preserved rather than
@@ -144,12 +149,12 @@ impl Client {
             let target = root.join(path);
             reject_manifest_conflict(&target, &manifest_target)?;
             validate_file_target(&target, &root)?;
-            let unchanged = previous
-                .files
-                .get(path.to_string_lossy().as_ref())
-                .is_some_and(|old| current_matches(&target, old, file));
-            let manifest_source;
-            if !unchanged {
+            let key = path.to_string_lossy().into_owned();
+            let old = previous.files.get(&key);
+            let entry = if let Some(old) = old.filter(|old| remote_matches(old, file)) {
+                // The manifest describes provider content, not the current disk.
+                old.clone()
+            } else {
                 downloaded += 1;
                 let staged = regular_stage.join(path);
                 if let Some(parent) = staged.parent() {
@@ -164,13 +169,14 @@ impl Client {
                     ));
                 })
                 .await?;
-                manifest_source = staged.clone();
-                staged_files.push((path.clone(), staged));
-            } else {
-                manifest_source = target.clone();
-            }
-            let entry = manifest_file(&manifest_source, file).await?;
-            desired.insert(path.to_string_lossy().into_owned(), entry);
+                let entry = manifest_file(&staged, file).await?;
+                // Without remote hashes, compare verified staging to provider history.
+                if old != Some(&entry) {
+                    staged_files.push((path.clone(), staged));
+                }
+                entry
+            };
+            desired.insert(key, entry);
             progress(SyncProgress::stage(
                 SyncStage::Install,
                 index + 1,
@@ -220,7 +226,8 @@ impl Client {
                 .await?;
                 reject_manifest_conflict(&target, &manifest_target)?;
                 validate_file_target(&target, &root)?;
-                let unchanged = current_manifest_matches(&target, &entry)?;
+                let unchanged =
+                    previous.files.get(relative.to_string_lossy().as_ref()) == Some(&entry);
                 desired.insert(relative.to_string_lossy().into_owned(), entry);
                 if !unchanged {
                     staged_files.push((relative, staged));
@@ -308,6 +315,7 @@ impl SyncProgress {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SyncReport {
+    /// Downloads performed, including staged comparisons that need no install.
     pub downloaded: usize,
     pub removed: usize,
 }
@@ -318,7 +326,7 @@ struct SyncManifest {
     files: BTreeMap<String, ManifestFile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ManifestFile {
     size: u64,
     sha1: String,
@@ -372,17 +380,19 @@ async fn hash_file(path: &Path) -> Result<(String, String, u64)> {
     ))
 }
 
-fn current_matches(path: &Path, old: &ManifestFile, remote: &RemoteFile) -> bool {
+fn remote_matches(old: &ManifestFile, remote: &RemoteFile) -> bool {
     if remote.size != Some(old.size) {
         return false;
     }
-    if let Some(hash) = remote.hashes.as_ref().and_then(|h| h.sha512.as_ref()) {
-        return hash == &old.sha512;
-    }
-    if let Some(hash) = remote.hashes.as_ref().and_then(|h| h.sha1.as_ref()) {
-        return hash == &old.sha1;
-    }
-    current_manifest_matches(path, old).unwrap_or(false)
+    let Some(hashes) = remote.hashes.as_ref() else {
+        return false;
+    };
+    (hashes.sha512.is_some() || hashes.sha1.is_some())
+        && hashes
+            .sha512
+            .as_ref()
+            .map_or(true, |hash| hash == &old.sha512)
+        && hashes.sha1.as_ref().map_or(true, |hash| hash == &old.sha1)
 }
 
 fn current_manifest_matches(path: &Path, old: &ManifestFile) -> Result<bool> {

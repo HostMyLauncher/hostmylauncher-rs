@@ -330,7 +330,7 @@ async fn unchanged_regular_file_is_skipped_and_modified_stale_file_is_preserved(
         .sync_instance_files(&files[..1], &root, &manifest, |_| {})
         .await
         .unwrap();
-    assert_eq!(report.downloaded, 0);
+    assert_eq!(report.downloaded, 1);
     assert_eq!(report.removed, 1);
     assert_eq!(read(root.join("keep.txt")), b"managed");
     assert_eq!(read(root.join("modified.txt")), b"user content");
@@ -566,4 +566,164 @@ async fn manifest_alias_cannot_overwrite_an_installed_asset() {
     assert_eq!(read(root.join("a.txt")), b"old");
     assert!(!root.join("missing").exists());
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+}
+
+fn hashed_remote(server: &FileServer, path: &str, body: &[u8]) -> RemoteFile {
+    use sha2::{Digest, Sha512};
+    let mut remote = server.remote(path, body.len());
+    remote.hashes = Some(hostmylauncher::models::Hashes {
+        sha512: Some(hex::encode(Sha512::digest(body))),
+        sha1: None,
+    });
+    remote
+}
+
+#[tokio::test]
+async fn provider_regular_policy_preserves_modified_and_missing_files() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let client = client(&server);
+    let files = [
+        hashed_remote(&server, "modified", b"managed"),
+        hashed_remote(&server, "missing", b"managed"),
+    ];
+    client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    std::fs::write(root.join("modified"), b"user content").unwrap();
+    std::fs::remove_file(root.join("missing")).unwrap();
+    let report = client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report.downloaded, 0);
+    assert_eq!(report.removed, 0);
+    assert_eq!(read(root.join("modified")), b"user content");
+    assert!(!root.join("missing").exists());
+    assert_eq!(read(&manifest), saved);
+    let updated = FileServer::new(b"updated".to_vec());
+    let report = client
+        .sync_instance_files(
+            &[
+                hashed_remote(&updated, "modified", b"updated"),
+                hashed_remote(&updated, "missing", b"updated"),
+            ],
+            &root,
+            &manifest,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.downloaded, 2);
+    assert_eq!(read(root.join("modified")), b"updated");
+    assert_eq!(read(root.join("missing")), b"updated");
+}
+
+#[tokio::test]
+async fn provider_override_policy_preserves_local_changes_until_provider_changes() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let body = archive("config.txt", b"managed");
+    let server = FileServer::new(body.clone());
+    let client = client(&server);
+    let files = [server.remote("overrides.zip", body.len())];
+    client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    std::fs::write(root.join("config.txt"), b"user content").unwrap();
+    client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(read(root.join("config.txt")), b"user content");
+    assert_eq!(read(&manifest), saved);
+    std::fs::remove_file(root.join("config.txt")).unwrap();
+    client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert!(!root.join("config.txt").exists());
+    assert_eq!(read(&manifest), saved);
+    let body = archive("config.txt", b"updated");
+    let updated = FileServer::new(body.clone());
+    client
+        .sync_instance_files(
+            &[updated.remote("overrides.zip", body.len())],
+            &root,
+            &manifest,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(read(root.join("config.txt")), b"updated");
+}
+
+#[tokio::test]
+async fn provider_without_hashes_compares_staging_and_rejects_corrupt_updates() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let client = client(&server);
+    let files = [server.remote("file.txt", 7)];
+    client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    std::fs::write(root.join("file.txt"), b"user content").unwrap();
+    let report = client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report.downloaded, 1);
+    assert_eq!(report.removed, 0);
+    assert_eq!(read(root.join("file.txt")), b"user content");
+    assert_eq!(read(&manifest), saved);
+    let updated = FileServer::new(b"updated".to_vec());
+    // Same size is not enough to infer unchanged provider content.
+    client
+        .sync_instance_files(&[updated.remote("file.txt", 7)], &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(read(root.join("file.txt")), b"updated");
+    let saved = read(&manifest);
+    let bad = hashed_remote(&updated, "file.txt", b"invalid");
+    let error = client
+        .sync_instance_files(&[bad], &root, &manifest, |_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "sha512 mismatch");
+    assert_eq!(read(root.join("file.txt")), b"updated");
+    assert_eq!(read(&manifest), saved);
+}
+
+#[tokio::test]
+async fn provider_fast_path_requires_all_supplied_hashes_to_match() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let client = client(&server);
+    let mut remote = hashed_remote(&server, "file.txt", b"managed");
+    client
+        .sync_instance_files(&[remote.clone()], &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    remote.hashes.as_mut().unwrap().sha1 = Some("0".repeat(40));
+    let error = client
+        .sync_instance_files(&[remote], &root, &manifest, |_| {})
+        .await
+        .unwrap_err();
+    assert!(error.to_string().starts_with("sha1 mismatch"), "{error}");
+    assert_eq!(read(root.join("file.txt")), b"managed");
+    assert_eq!(read(&manifest), saved);
 }
