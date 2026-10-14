@@ -277,6 +277,9 @@ impl Client {
     }
 }
 
+mod inspection;
+pub use inspection::{FileIssue, FileIssueKind, RepairReport, VerificationReport};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SyncStage {
     Download,

@@ -41,7 +41,9 @@ pub use realtime::{ConnectOpts, Realtime};
 #[cfg(feature = "download")]
 pub use download::extract_overrides;
 #[cfg(feature = "download")]
-pub use download::{SyncProgress, SyncReport, SyncStage};
+pub use download::{
+    FileIssue, FileIssueKind, RepairReport, SyncProgress, SyncReport, SyncStage, VerificationReport,
+};
 
 #[cfg(feature = "watch")]
 pub use watch::InstanceWatcher;

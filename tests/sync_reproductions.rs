@@ -727,3 +727,350 @@ async fn provider_fast_path_requires_all_supplied_hashes_to_match() {
     assert_eq!(read(root.join("file.txt")), b"managed");
     assert_eq!(read(&manifest), saved);
 }
+
+#[tokio::test]
+async fn verification_reports_disk_differences_without_modifying_installation() {
+    use hostmylauncher::FileIssueKind;
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let client = client(&server);
+    let mut files = [
+        hashed_remote(&server, "good", b"managed"),
+        hashed_remote(&server, "modified", b"managed"),
+        hashed_remote(&server, "missing", b"managed"),
+    ];
+    client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    std::fs::write(root.join("modified"), b"edited!").unwrap();
+    std::fs::remove_file(root.join("missing")).unwrap();
+    std::fs::write(root.join("unmanaged"), b"user").unwrap();
+    // Hash-bearing verification must not need download URLs or previous history.
+    for file in &mut files {
+        file.downloads.clear();
+    }
+    let report = client.verify_instance_files(&files, &root).await.unwrap();
+    assert_eq!(report.checked, 3);
+    assert!(!report.is_valid());
+    assert_eq!(report.issues.len(), 2);
+    assert_eq!(report.issues[0].path, "missing");
+    assert_eq!(report.issues[0].kind, FileIssueKind::Missing);
+    assert_eq!(report.issues[1].path, "modified");
+    assert_eq!(report.issues[1].kind, FileIssueKind::Different);
+    assert_eq!(read(root.join("modified")), b"edited!");
+    assert!(!root.join("missing").exists());
+    assert_eq!(read(root.join("good")), b"managed");
+    assert_eq!(read(root.join("unmanaged")), b"user");
+    assert_eq!(read(&manifest), saved);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 3);
+}
+
+#[tokio::test]
+async fn verification_of_missing_root_does_not_create_it() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("missing/instance");
+    let server = FileServer::new(b"managed".to_vec());
+    let mut file = hashed_remote(&server, "mods/a", b"managed");
+    file.downloads.clear();
+    let report = client(&server)
+        .verify_instance_files(&[file], &root)
+        .await
+        .unwrap();
+    assert_eq!(report.checked, 1);
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(
+        report.issues[0].kind,
+        hostmylauncher::FileIssueKind::Missing
+    );
+    assert!(!sandbox.path().join("missing").exists());
+}
+
+#[tokio::test]
+async fn repair_restores_user_edits_and_missing_files_without_removing_extras() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let client = client(&server);
+    let files = [
+        hashed_remote(&server, "good", b"managed"),
+        hashed_remote(&server, "modified", b"managed"),
+        hashed_remote(&server, "missing", b"managed"),
+    ];
+    let mut initial = files.to_vec();
+    initial.push(hashed_remote(&server, "obsolete", b"managed"));
+    client
+        .sync_instance_files(&initial, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    let original_manifest = read(&manifest);
+    std::fs::write(root.join("modified"), b"edited!").unwrap();
+    std::fs::remove_file(root.join("missing")).unwrap();
+    std::fs::write(root.join("unmanaged"), b"user").unwrap();
+    let report = client
+        .repair_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report.repaired, 2);
+    assert_eq!(report.downloaded, 2);
+    assert_eq!(report.verification.checked, 3);
+    assert_eq!(report.verification.issues.len(), 2);
+    for path in ["good", "modified", "missing", "obsolete"] {
+        assert_eq!(read(root.join(path)), b"managed");
+    }
+    assert_eq!(read(root.join("unmanaged")), b"user");
+    assert_eq!(read(&manifest), original_manifest);
+    assert!(client
+        .verify_instance_files(&files, &root)
+        .await
+        .unwrap()
+        .is_valid());
+    let report = client
+        .repair_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report.repaired, 0);
+    assert_eq!(report.downloaded, 0);
+    assert!(report.verification.is_valid());
+}
+
+#[tokio::test]
+async fn verification_and_repair_handle_unhashed_files_and_overrides() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let body = archive("config.txt", b"expected");
+    let overrides = FileServer::new(body.clone());
+    let client = client(&server);
+    let files = [
+        server.remote("regular", 7),
+        overrides.remote("overrides.zip", body.len()),
+    ];
+    client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    std::fs::write(root.join("regular"), b"edited!").unwrap();
+    std::fs::remove_file(root.join("config.txt")).unwrap();
+    let report = client.verify_instance_files(&files, &root).await.unwrap();
+    assert_eq!(report.checked, 2);
+    assert_eq!(report.issues.len(), 2);
+    assert_eq!(read(root.join("regular")), b"edited!");
+    assert!(!root.join("config.txt").exists());
+    assert_eq!(read(&manifest), saved);
+    let report = client
+        .repair_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report.repaired, 2);
+    assert_eq!(report.downloaded, 2);
+    assert_eq!(read(root.join("regular")), b"managed");
+    assert_eq!(read(root.join("config.txt")), b"expected");
+    assert!(client
+        .verify_instance_files(&files, &root)
+        .await
+        .unwrap()
+        .is_valid());
+}
+
+#[tokio::test]
+async fn repair_rejects_bad_downloads_without_changing_files_or_manifest() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let client = client(&server);
+    client
+        .sync_instance_files(
+            &[hashed_remote(&server, "file", b"managed")],
+            &root,
+            &manifest,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    let bad = hashed_remote(&server, "file", b"invalid");
+    let error = client
+        .repair_instance_files(&[bad], &root, &manifest, |_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "sha512 mismatch");
+    assert_eq!(read(root.join("file")), b"managed");
+    assert_eq!(read(&manifest), saved);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn repair_rolls_back_if_manifest_cannot_be_saved() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("existing"), b"user").unwrap();
+    let blocker = sandbox.path().join("blocker");
+    std::fs::write(&blocker, b"keep").unwrap();
+    let server = FileServer::new(b"managed".to_vec());
+    let files = [
+        hashed_remote(&server, "existing", b"managed"),
+        hashed_remote(&server, "nested/new", b"managed"),
+    ];
+    assert!(client(&server)
+        .repair_instance_files(&files, &root, &blocker.join("manifest.json"), |_| {})
+        .await
+        .is_err());
+    assert_eq!(read(root.join("existing")), b"user");
+    assert_eq!(read(&blocker), b"keep");
+    assert!(!root.join("nested").exists());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verification_and_repair_reject_symlinks_without_touching_outside_files() {
+    use std::os::unix::fs::symlink;
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    std::fs::create_dir(&root).unwrap();
+    let outside = sandbox.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    symlink(&outside, root.join("file")).unwrap();
+    let server = FileServer::new(b"managed".to_vec());
+    let files = [hashed_remote(&server, "file", b"managed")];
+    let client = client(&server);
+    assert!(client.verify_instance_files(&files, &root).await.is_err());
+    let manifest = sandbox.path().join("manifest.json");
+    assert!(client
+        .repair_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .is_err());
+    assert_eq!(read(&outside), b"outside");
+    assert!(!manifest.exists());
+    assert!(std::fs::symlink_metadata(root.join("file"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[tokio::test]
+async fn verification_supports_sha1_without_size_and_checks_every_supplied_hash() {
+    use sha1::{Digest, Sha1};
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("file"), b"managed").unwrap();
+    let server = FileServer::new(b"managed".to_vec());
+    let mut file = server.remote("file", 7);
+    file.size = None;
+    file.downloads.clear();
+    file.hashes = Some(hostmylauncher::Hashes {
+        sha1: Some(hex::encode(Sha1::digest(b"managed"))),
+        sha512: None,
+    });
+    assert!(client(&server)
+        .verify_instance_files(&[file], &root)
+        .await
+        .unwrap()
+        .is_valid());
+    let mut file = hashed_remote(&server, "file", b"managed");
+    file.hashes.as_mut().unwrap().sha1 = Some("0".repeat(40));
+    let report = client(&server)
+        .verify_instance_files(&[file.clone()], &root)
+        .await
+        .unwrap();
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(
+        report.issues[0].kind,
+        hostmylauncher::FileIssueKind::Different
+    );
+    assert!(client(&server)
+        .repair_instance_files(&[file], &root, &root.join("manifest.json"), |_| {})
+        .await
+        .is_err());
+    assert_eq!(read(root.join("file")), b"managed");
+    assert!(!root.join("manifest.json").exists());
+}
+
+#[tokio::test]
+async fn inspection_rejects_unsafe_duplicate_and_manifest_conflicting_paths() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = root.join("manifest.json");
+    let server = FileServer::new(b"managed".to_vec());
+    let client = client(&server);
+    client
+        .sync_instance_files(
+            &[hashed_remote(&server, "good", b"managed")],
+            &root,
+            &manifest,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    let saved = read(&manifest);
+    for files in [
+        vec![server.remote("../escape", 7)],
+        vec![server.remote("good", 7), server.remote("good", 7)],
+    ] {
+        assert!(client.verify_instance_files(&files, &root).await.is_err());
+        assert!(client
+            .repair_instance_files(&files, &root, &manifest, |_| {})
+            .await
+            .is_err());
+        assert_eq!(read(root.join("good")), b"managed");
+        assert_eq!(read(&manifest), saved);
+        assert!(!sandbox.path().join("escape").exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+    }
+    for path in ["manifest.json", "manifest.json/asset"] {
+        let error = client
+            .repair_instance_files(&[server.remote(path, 7)], &root, &manifest, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "instance file conflicts with manifest path"
+        );
+        assert_eq!(read(&manifest), saved);
+        assert_eq!(read(root.join("good")), b"managed");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inspection_rejects_symlink_parents_for_regular_and_override_entries() {
+    use std::os::unix::fs::symlink;
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let outside = sandbox.path().join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("file"), b"outside").unwrap();
+    symlink(&outside, root.join("mods")).unwrap();
+    let server = FileServer::new(b"managed".to_vec());
+    let body = archive("mods/file", b"managed");
+    let overrides = FileServer::new(body.clone());
+    let manifest = sandbox.path().join("manifest.json");
+    for files in [
+        vec![hashed_remote(&server, "mods/file", b"managed")],
+        vec![overrides.remote("overrides.zip", body.len())],
+    ] {
+        assert!(client(&server)
+            .verify_instance_files(&files, &root)
+            .await
+            .is_err());
+        assert!(client(&server)
+            .repair_instance_files(&files, &root, &manifest, |_| {})
+            .await
+            .is_err());
+        assert_eq!(read(outside.join("file")), b"outside");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(!manifest.exists());
+    }
+}

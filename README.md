@@ -128,11 +128,83 @@ parent directories for a caller-selected external manifest are not rolled back.
 Run the regression tests with `cargo test --offline --lib --test sync_reproductions`.
 Symlink tests run on Unix only.
 
+## Verify and repair an installation
+
+These operations require the `download` feature and a current file list from
+`get_instance_files`. Neither operation uses the old manifest to decide whether
+an installed file is correct: they compare the actual disk with provider content.
+
+```rust,no_run
+# async fn example() -> hostmylauncher::Result<()> {
+use hostmylauncher::{Client, FileIssueKind};
+use std::path::Path;
+
+let client = Client::new();
+let files = client.get_instance_files("launcher-a", "instance-a", None).await?;
+let destination = Path::new("instances/instance-a");
+let manifest = destination.join(".hostmylauncher-manifest.json");
+
+let verification = client.verify_instance_files(&files, destination).await?;
+for issue in &verification.issues {
+    match issue.kind {
+        FileIssueKind::Missing => println!("Missing: {}", issue.path),
+        FileIssueKind::Different => println!("Different: {}", issue.path),
+    }
+}
+
+// Repair is explicit: it replaces user edits as well as corrupt/missing files.
+if !verification.is_valid() {
+    let repair = client.repair_instance_files(
+        &files, destination, &manifest,
+        |progress| println!("{progress:?}"),
+    ).await?;
+    println!("Repaired {} files", repair.repaired);
+}
+# Ok(())
+# }
+```
+
+| Operation | Compares | Effect |
+|-----------|----------|--------|
+| `sync_instance_files` | Current provider content vs saved provider manifest | Installs provider changes; preserves local divergence for unchanged provider files. |
+| `verify_instance_files` | Actual installed files vs current provider content | Returns missing/different paths; does not modify or create the installation or its manifest. |
+| `repair_instance_files` | Actual installed files vs current provider content | Restores missing/different expected files, including user modifications. |
+
+`VerificationReport.checked` counts expected files, including extracted override
+entries, not the ZIP itself. `issues` is sorted by relative path and distinguishes
+`Missing` from `Different`. An empty expected list produces a valid empty report;
+this is not proof that a complete instance is installed. Unrelated files are not
+inspected or reported.
+
+Verification hashes actual files. If remote hashes are supplied, it checks every
+supplied hash and the size when present, without downloading those regular files.
+Without hashes, it downloads and verifies reference content in temporary storage.
+`overrides.zip` is always downloaded, verified, and extracted to temporary storage
+so its entries can be checked. These reference downloads may need network access
+and free space; verification's temporary storage uses the system temporary directory.
+
+Repair performs its own inspection rather than trusting an earlier report. It
+stages verified content inside the destination and uses the same backup/rollback
+and manifest-last application as synchronization. It does **not** remove obsolete
+or unrelated files; previous manifest entries outside the supplied list are retained
+for future synchronization. `RepairReport.verification` describes differences
+**before** repair, `repaired` counts installed files, and `downloaded` counts
+downloads of regular files and override archives, including reference downloads
+that need no replacement. The progress callback reports download progress.
+
+Unsafe paths, symlinks at/below the instance root, non-file targets, unreadable
+files, and download/integrity failures return `Err`, not a partial success report.
+The manifest may not collide with an expected asset or its parent/child paths.
+Both operations require exclusive access while running. Repair has the same
+crash/concurrency and failed-rollback limitations as sync. A new destination root
+may remain after a failed first repair. These operations only manage listed assets;
+they do not install Java, Minecraft loaders, or other runtime prerequisites.
+
 ## Features
 
 | Feature    | Default | Adds                                                |
 |------------|---------|-----------------------------------------------------|
-| `download` | yes     | `Client::download_file`, `download_overrides`, and `sync_instance_files` (size + SHA verification) |
+| `download` | yes     | `Client::download_file`, `download_overrides`, `sync_instance_files`, `verify_instance_files`, and `repair_instance_files` (size + SHA verification) |
 | `watch`    | no      | `InstanceWatcher` live reconciled instance list     |
 
 ## Example
