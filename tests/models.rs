@@ -15,7 +15,10 @@ fn deserializes_instance_with_nested_and_extra() {
     let inst: Instance = serde_json::from_value(v).unwrap();
     assert_eq!(inst.id, "abc");
     assert_eq!(inst.launcher_id.as_deref(), Some("lns"));
-    assert_eq!(inst.loader.as_ref().unwrap().kind.as_deref(), Some("fabric"));
+    assert_eq!(
+        inst.loader.as_ref().unwrap().kind.as_deref(),
+        Some("fabric")
+    );
     assert!(inst.loader.as_ref().unwrap().enabled);
     assert!(inst.users.as_ref().unwrap().no_premium);
     assert_eq!(inst.java_version, Some(17));
@@ -23,7 +26,10 @@ fn deserializes_instance_with_nested_and_extra() {
     assert_eq!(inst.downloads, 9);
     assert_eq!(inst.hide, Some(true));
     // unmodeled fields are preserved in `extra`
-    assert_eq!(inst.extra.get("code").and_then(|c| c.as_str()), Some("SECRET"));
+    assert_eq!(
+        inst.extra.get("code").and_then(|c| c.as_str()),
+        Some("SECRET")
+    );
 }
 
 #[test]
@@ -76,7 +82,11 @@ fn parses_sync_replay_with_nested_events() {
         ]
     }));
     match ev {
-        Event::Sync { mode, revision, events } => {
+        Event::Sync {
+            mode,
+            revision,
+            events,
+        } => {
             assert_eq!(mode, SyncMode::Replay);
             assert_eq!(revision, 5);
             assert_eq!(events.len(), 2);

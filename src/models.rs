@@ -211,7 +211,11 @@ impl Event {
 
     /// Parses a single JSON frame (or a replayed event) into an [`Event`].
     pub fn parse(v: Value) -> Event {
-        let kind = v.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+        let kind = v
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let revision = v.get("revision").and_then(Value::as_u64).unwrap_or(0);
         let payload_id = || {
             v.get("payload")
@@ -232,7 +236,11 @@ impl Event {
                     .and_then(Value::as_array)
                     .map(|arr| arr.iter().cloned().map(Event::parse).collect())
                     .unwrap_or_default();
-                Event::Sync { mode, revision, events }
+                Event::Sync {
+                    mode,
+                    revision,
+                    events,
+                }
             }
             "instance.created" => Event::InstanceCreated {
                 id: payload_id(),
@@ -243,11 +251,26 @@ impl Event {
                     .map(String::from),
                 revision,
             },
-            "instance.updated" => Event::InstanceUpdated { id: payload_id(), revision },
-            "instance.deleted" => Event::InstanceDeleted { id: payload_id(), revision },
-            "news.created" => Event::NewsCreated { id: payload_id(), revision },
-            "news.updated" => Event::NewsUpdated { id: payload_id(), revision },
-            "news.deleted" => Event::NewsDeleted { id: payload_id(), revision },
+            "instance.updated" => Event::InstanceUpdated {
+                id: payload_id(),
+                revision,
+            },
+            "instance.deleted" => Event::InstanceDeleted {
+                id: payload_id(),
+                revision,
+            },
+            "news.created" => Event::NewsCreated {
+                id: payload_id(),
+                revision,
+            },
+            "news.updated" => Event::NewsUpdated {
+                id: payload_id(),
+                revision,
+            },
+            "news.deleted" => Event::NewsDeleted {
+                id: payload_id(),
+                revision,
+            },
             "storage.changed" => Event::StorageChanged { revision },
             "launcher.deleted" => Event::LauncherDeleted { revision },
             _ => Event::Other(serde_json::from_value(v).unwrap_or(RawEvent {

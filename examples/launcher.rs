@@ -36,7 +36,9 @@ async fn main() -> hostmylauncher::Result<()> {
                 );
                 let files = client
                     .get_instance_files(
-                        inst.launcher_id.as_deref().expect("resolver returns launcher_id"),
+                        inst.launcher_id
+                            .as_deref()
+                            .expect("resolver returns launcher_id"),
                         &inst.id,
                         Some(&code),
                     )

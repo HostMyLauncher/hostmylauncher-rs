@@ -33,7 +33,9 @@ impl InstanceWatcher {
     /// Starts watching a launcher: fetches the current instances, then keeps them
     /// updated from the real-time connection.
     pub async fn start(client: Client, launcher_id: &str) -> Result<Self> {
-        let initial = client.list_instances(launcher_id, &ListOpts::default()).await?;
+        let initial = client
+            .list_instances(launcher_id, &ListOpts::default())
+            .await?;
         let mut map: HashMap<String, Instance> =
             initial.into_iter().map(|i| (i.id.clone(), i)).collect();
 
@@ -55,7 +57,10 @@ impl InstanceWatcher {
             }
         });
 
-        Ok(Self { instances: rx, stop })
+        Ok(Self {
+            instances: rx,
+            stop,
+        })
     }
 
     /// A snapshot of the current instances.
@@ -77,17 +82,16 @@ impl InstanceWatcher {
 
 fn sorted(map: &HashMap<String, Instance>) -> Vec<Instance> {
     let mut v: Vec<Instance> = map.values().cloned().collect();
-    v.sort_by(|a, b| {
-        a.title
-            .cmp(&b.title)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    v.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
     v
 }
 
 async fn apply(client: &Client, lid: &str, map: &mut HashMap<String, Instance>, ev: Event) {
     match ev {
-        Event::Sync { mode: SyncMode::Hydrate, .. } => {
+        Event::Sync {
+            mode: SyncMode::Hydrate,
+            ..
+        } => {
             if let Ok(list) = client.list_instances(lid, &ListOpts::default()).await {
                 map.clear();
                 for i in list {
