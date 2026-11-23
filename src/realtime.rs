@@ -163,7 +163,7 @@ where
         tokio::select! {
             _ = ping.tick() => {
                 // Literal "ping" frame: the DO replies "pong" without waking.
-                if sink.send(Message::Text("ping".to_string().into())).await.is_err() {
+                if sink.send(Message::Text("ping".to_string())).await.is_err() {
                     return false; // reconnect
                 }
             }

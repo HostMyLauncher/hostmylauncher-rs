@@ -6,8 +6,9 @@ pub enum Error {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// Boxed: the websocket error is ~136 bytes and would bloat every `Result`.
     #[error("websocket error: {0}")]
-    Ws(#[from] tokio_tungstenite::tungstenite::Error),
+    Ws(Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("decode error: {0}")]
     Decode(#[from] serde_json::Error),
@@ -30,6 +31,12 @@ pub enum Error {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for Error {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        Error::Ws(Box::new(error))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

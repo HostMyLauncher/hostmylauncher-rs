@@ -312,16 +312,13 @@ fn entry_from_hashes((sha1, sha512, size): (String, String, u64)) -> ManifestFil
 }
 
 fn disk_matches_remote(actual: &ManifestFile, remote: &RemoteFile) -> bool {
-    remote.size.map_or(true, |size| size == actual.size)
+    remote.size.is_none_or(|size| size == actual.size)
         && remote.hashes.as_ref().is_some_and(|hashes| {
-            hashes
-                .sha1
-                .as_ref()
-                .map_or(true, |hash| hash == &actual.sha1)
+            hashes.sha1.as_ref().is_none_or(|hash| hash == &actual.sha1)
                 && hashes
                     .sha512
                     .as_ref()
-                    .map_or(true, |hash| hash == &actual.sha512)
+                    .is_none_or(|hash| hash == &actual.sha512)
         })
 }
 

@@ -394,8 +394,8 @@ fn remote_matches(old: &ManifestFile, remote: &RemoteFile) -> bool {
         && hashes
             .sha512
             .as_ref()
-            .map_or(true, |hash| hash == &old.sha512)
-        && hashes.sha1.as_ref().map_or(true, |hash| hash == &old.sha1)
+            .is_none_or(|hash| hash == &old.sha512)
+        && hashes.sha1.as_ref().is_none_or(|hash| hash == &old.sha1)
 }
 
 fn current_manifest_matches(path: &Path, old: &ManifestFile) -> Result<bool> {
@@ -840,6 +840,58 @@ fn ensure_real_directory(path: &Path, root: &Path) -> Result<()> {
     create_real_directory(path, root, &mut Vec::new())
 }
 
+async fn try_download<F>(
+    http: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    file: &RemoteFile,
+    progress: &F,
+) -> Result<()>
+where
+    F: Fn(u64, u64),
+{
+    let resp = http.get(url).send().await?.error_for_status()?;
+    let total = file.size.or_else(|| resp.content_length()).unwrap_or(0);
+
+    let mut out = tokio::fs::File::create(dest).await?;
+    let mut sha1 = Sha1::new();
+    let mut sha512 = Sha512::new();
+    let mut downloaded = 0u64;
+
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        out.write_all(&chunk).await?;
+        sha1.update(&chunk);
+        sha512.update(&chunk);
+        downloaded += chunk.len() as u64;
+        progress(downloaded, total);
+    }
+    out.flush().await?;
+
+    if let Some(expected) = file.size {
+        if downloaded != expected {
+            return Err(Error::Other(format!(
+                "size mismatch: got {downloaded}, expected {expected}"
+            )));
+        }
+    }
+    if let Some(h) = &file.hashes {
+        if let Some(expected) = &h.sha512 {
+            let got = hex::encode(sha512.finalize());
+            if &got != expected {
+                return Err(Error::Other("sha512 mismatch".into()));
+            }
+        } else if let Some(expected) = &h.sha1 {
+            let got = hex::encode(sha1.finalize());
+            if &got != expected {
+                return Err(Error::Other("sha1 mismatch".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,56 +1010,4 @@ mod tests {
         let path = tempfile::tempdir().unwrap().path().join("missing.json");
         assert!(load_manifest(&path).unwrap().files.is_empty());
     }
-}
-
-async fn try_download<F>(
-    http: &reqwest::Client,
-    url: &str,
-    dest: &Path,
-    file: &RemoteFile,
-    progress: &F,
-) -> Result<()>
-where
-    F: Fn(u64, u64),
-{
-    let resp = http.get(url).send().await?.error_for_status()?;
-    let total = file.size.or_else(|| resp.content_length()).unwrap_or(0);
-
-    let mut out = tokio::fs::File::create(dest).await?;
-    let mut sha1 = Sha1::new();
-    let mut sha512 = Sha512::new();
-    let mut downloaded = 0u64;
-
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        out.write_all(&chunk).await?;
-        sha1.update(&chunk);
-        sha512.update(&chunk);
-        downloaded += chunk.len() as u64;
-        progress(downloaded, total);
-    }
-    out.flush().await?;
-
-    if let Some(expected) = file.size {
-        if downloaded != expected {
-            return Err(Error::Other(format!(
-                "size mismatch: got {downloaded}, expected {expected}"
-            )));
-        }
-    }
-    if let Some(h) = &file.hashes {
-        if let Some(expected) = &h.sha512 {
-            let got = hex::encode(sha512.finalize());
-            if &got != expected {
-                return Err(Error::Other("sha512 mismatch".into()));
-            }
-        } else if let Some(expected) = &h.sha1 {
-            let got = hex::encode(sha1.finalize());
-            if &got != expected {
-                return Err(Error::Other("sha1 mismatch".into()));
-            }
-        }
-    }
-    Ok(())
 }
