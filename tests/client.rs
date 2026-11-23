@@ -97,7 +97,7 @@ async fn resolve_propagates_collision_throttle_and_storage_failure_without_retry
 }
 
 #[tokio::test]
-async fn existing_global_id_and_file_reads_keep_get_and_query_contracts() {
+async fn existing_global_id_and_file_reads_keep_get_contracts_and_send_code_in_header() {
     let (client, worker) = fixture(200, r#"{"success":true,"data":{"id":"visible"}}"#);
     assert_eq!(
         client.get_instance_global("visible").await.unwrap().id,
@@ -118,10 +118,22 @@ async fn existing_global_id_and_file_reads_keep_get_and_query_contracts() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path.as_deref(), Some("mods/a.jar"));
     assert_eq!(files[0].downloads, vec!["https://cdn.example/a.jar"]);
-    assert!(worker
-        .join()
-        .unwrap()
-        .starts_with("GET /launchers/a/instances/hidden/files?code=secret HTTP/1.1\r\n"));
+    let request = worker.join().unwrap();
+    assert!(request.starts_with("GET /launchers/a/instances/hidden/files HTTP/1.1\r\n"));
+    assert!(request
+        .to_ascii_lowercase()
+        .contains("\r\nx-instance-code: secret\r\n"));
+
+    // A code that cannot be a header value still reaches the API in the query.
+    let (client, worker) = fixture(200, r#"{"success":true,"results":[]}"#);
+    client
+        .get_instance_files("a", "hidden", Some("ñandú"))
+        .await
+        .unwrap();
+    let request = worker.join().unwrap();
+    assert!(request
+        .starts_with("GET /launchers/a/instances/hidden/files?code=%C3%B1and%C3%BA HTTP/1.1\r\n"));
+    assert!(!request.to_ascii_lowercase().contains("x-instance-code"));
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use reqwest::header::HeaderValue;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use url::Url;
@@ -146,25 +147,36 @@ impl Client {
         take_data(body)
     }
 
-    /// Returns an instance's downloadable file list. Locked instances require a
-    /// valid `code` for public callers.
+    /// Returns an instance's downloadable file list. Hidden or locked instances
+    /// require a valid `code` for public callers.
+    ///
+    /// The code travels in the `X-Instance-Code` header so it stays out of URLs
+    /// and access logs. A non-ASCII code, which headers cannot carry intact, falls
+    /// back to the `?code=` query, which the API still accepts.
     pub async fn get_instance_files(
         &self,
         launcher_id: &str,
         id: &str,
         code: Option<&str>,
     ) -> Result<Vec<RemoteFile>> {
-        let q: Vec<(&str, String)> = match code {
-            Some(c) => vec![("code", c.to_string())],
-            None => vec![],
-        };
-        let body = self
-            .get(
-                &format!("/launchers/{launcher_id}/instances/{id}/files"),
-                &q,
-            )
-            .await?;
-        take_results(body)
+        let mut query: Vec<(&str, String)> = Vec::new();
+        let mut header = None;
+        if let Some(code) = code {
+            // Header values reach the Worker as Latin-1, so only ASCII survives intact.
+            match HeaderValue::from_str(code).ok().filter(|_| code.is_ascii()) {
+                Some(mut value) => {
+                    value.set_sensitive(true);
+                    header = Some(value);
+                }
+                None => query.push(("code", code.to_string())),
+            }
+        }
+        let path = format!("/launchers/{launcher_id}/instances/{id}/files");
+        let mut request = self.http.get(self.build_url(&path, &query));
+        if let Some(value) = header {
+            request = request.header("X-Instance-Code", value);
+        }
+        take_results(self.send(request).await?)
     }
 
     /// Registers a download, returning the new total count.
