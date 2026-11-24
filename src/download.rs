@@ -27,10 +27,24 @@ use crate::error::{Error, Result};
 use crate::models::RemoteFile;
 
 impl Client {
-    /// Downloads a file to `dest`, verifying its declared `size` and hash
-    /// (preferring sha512, then sha1). Retries up to 3 times. `progress` is
-    /// called with `(downloaded, total)` byte counts.
+    /// Downloads a file to `dest`, verifying its declared `size` and every
+    /// declared hash. Retries up to 3 times. `progress` is called with
+    /// `(downloaded, total)` byte counts.
     pub async fn download_file<F>(&self, file: &RemoteFile, dest: &Path, progress: F) -> Result<()>
+    where
+        F: Fn(u64, u64),
+    {
+        self.download_entry(file, dest, progress).await.map(|_| ())
+    }
+
+    /// `download_file`, returning the size and hashes computed while
+    /// downloading so callers need not read the file again.
+    async fn download_entry<F>(
+        &self,
+        file: &RemoteFile,
+        dest: &Path,
+        progress: F,
+    ) -> Result<ManifestFile>
     where
         F: Fn(u64, u64),
     {
@@ -47,7 +61,7 @@ impl Client {
         loop {
             attempt += 1;
             match try_download(&self.http, url, dest, file, &progress).await {
-                Ok(()) => return Ok(()),
+                Ok(entry) => return Ok(entry),
                 Err(e) => {
                     let _ = tokio::fs::remove_file(dest).await;
                     if attempt >= 3 {
@@ -183,9 +197,9 @@ impl Client {
         for (path, file, staged) in pending {
             let (progress, prepare, bytes) = (&progress, &prepare, &bytes);
             downloads.push(async move {
-                self.download_file(file, &staged, bytes.file(path, progress))
+                let entry = self
+                    .download_entry(file, &staged, bytes.file(path, progress))
                     .await?;
-                let entry = manifest_file(&staged, file).await?;
                 prepare(path);
                 Ok::<_, Error>((path, staged, entry))
             });
@@ -909,7 +923,7 @@ async fn try_download<F>(
     dest: &Path,
     file: &RemoteFile,
     progress: &F,
-) -> Result<()>
+) -> Result<ManifestFile>
 where
     F: Fn(u64, u64),
 {
@@ -939,20 +953,26 @@ where
             )));
         }
     }
+    let entry = ManifestFile {
+        size: downloaded,
+        sha1: hex::encode(sha1.finalize()),
+        sha512: hex::encode(sha512.finalize()),
+    };
     if let Some(h) = &file.hashes {
-        if let Some(expected) = &h.sha512 {
-            let got = hex::encode(sha512.finalize());
-            if &got != expected {
-                return Err(Error::Other("sha512 mismatch".into()));
-            }
-        } else if let Some(expected) = &h.sha1 {
-            let got = hex::encode(sha1.finalize());
-            if &got != expected {
-                return Err(Error::Other("sha1 mismatch".into()));
-            }
+        if h.sha512
+            .as_ref()
+            .is_some_and(|expected| expected != &entry.sha512)
+        {
+            return Err(Error::Other("sha512 mismatch".into()));
+        }
+        if h.sha1
+            .as_ref()
+            .is_some_and(|expected| expected != &entry.sha1)
+        {
+            return Err(Error::Other("sha1 mismatch".into()));
         }
     }
-    Ok(())
+    Ok(entry)
 }
 
 #[cfg(test)]

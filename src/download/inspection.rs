@@ -219,8 +219,8 @@ impl Client {
             let bytes = &bytes;
             downloads.push(async move {
                 let staged = staging.join("regular").join(path);
-                download_reference(self, file, &staged, bytes.file(path, progress)).await?;
-                let expected = manifest_file(&staged, file).await?;
+                let expected =
+                    download_reference(self, file, &staged, bytes.file(path, progress)).await?;
                 Ok::<_, Error>((path, staged, actual, has_hash, expected))
             });
         }
@@ -247,8 +247,6 @@ impl Client {
             let archive = staging.join("overrides.zip");
             let callback = bytes.file(Path::new("overrides.zip"), progress);
             download_reference(self, file, &archive, callback).await?;
-            // download_file prefers SHA512; check every supplied hash too.
-            manifest_file(&archive, file).await?;
             inspection.downloaded += 1;
             let extracted = staging.join("overrides");
             extract_overrides(&archive, &extracted)?;
@@ -347,9 +345,9 @@ async fn download_reference(
     remote: &RemoteFile,
     staged: &Path,
     progress: impl Fn(u64, u64),
-) -> Result<()> {
+) -> Result<ManifestFile> {
     if let Some(parent) = staged.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    client.download_file(remote, staged, progress).await
+    client.download_entry(remote, staged, progress).await
 }
