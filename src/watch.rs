@@ -6,11 +6,10 @@
 //! removes it, i.e. access revocation), and `sync(hydrate)` re-lists everything.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use futures::StreamExt;
 use tokio::sync::watch;
+use tokio::task::AbortHandle;
 
 use crate::client::Client;
 use crate::error::{Error, Result};
@@ -18,14 +17,17 @@ use crate::models::{Event, Instance, ListOpts, SyncMode};
 use crate::realtime::ConnectOpts;
 
 /// A self-updating view of a launcher's instances.
+///
+/// Dropping it stops the background task and closes the real-time connection
+/// right away; receivers from [`InstanceWatcher::subscribe`] then stop changing.
 pub struct InstanceWatcher {
     instances: watch::Receiver<Vec<Instance>>,
-    stop: Arc<AtomicBool>,
+    task: AbortHandle,
 }
 
 impl Drop for InstanceWatcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
     }
 }
 
@@ -40,26 +42,31 @@ impl InstanceWatcher {
             initial.into_iter().map(|i| (i.id.clone(), i)).collect();
 
         let (tx, rx) = watch::channel(sorted(&map));
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_task = stop.clone();
         let lid = launcher_id.to_string();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut rt = client.connect(&lid, ConnectOpts::default());
             while let Some(ev) = rt.next().await {
-                if stop_task.load(Ordering::Relaxed) {
-                    break;
-                }
                 apply(&client, &lid, &mut map, ev).await;
-                if tx.send(sorted(&map)).is_err() {
+                let next = sorted(&map);
+                // Events that change nothing (news, storage) wake no receiver.
+                tx.send_if_modified(|current| {
+                    let changed = *current != next;
+                    if changed {
+                        *current = next;
+                    }
+                    changed
+                });
+                if tx.is_closed() {
                     break; // all receivers dropped
                 }
             }
-        });
+        })
+        .abort_handle();
 
         Ok(Self {
             instances: rx,
-            stop,
+            task,
         })
     }
 

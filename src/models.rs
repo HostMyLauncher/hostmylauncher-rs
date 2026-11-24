@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// A launcher instance (modpack / server config).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Instance {
     pub id: String,
     #[serde(default)]
@@ -53,7 +53,7 @@ pub struct Instance {
 }
 
 /// Mod loader configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Loader {
     #[serde(rename = "type", default)]
     pub kind: Option<String>,
@@ -64,7 +64,7 @@ pub struct Loader {
 }
 
 /// Player access settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Users {
     #[serde(default)]
     pub whitelist: Vec<String>,
@@ -75,7 +75,7 @@ pub struct Users {
 /// A downloadable file group. `downloads` holds direct URLs (often an external
 /// CDN). `size`/`hashes` allow integrity verification. A special entry with
 /// `path == "overrides.zip"` carries a zipped overrides bundle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RemoteFile {
     #[serde(default)]
     pub path: Option<String>,
@@ -89,7 +89,7 @@ pub struct RemoteFile {
     pub downloads: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Hashes {
     #[serde(default)]
     pub sha1: Option<String>,

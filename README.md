@@ -5,10 +5,12 @@ Built for Tauri launchers.
 
 - Typed REST: list/get/resolve-by-code instances, file lists, news, download counter.
 - Real-time: a self-reconnecting [`Realtime`] event stream over the launcher WebSocket
-  (Durable Object), with `since` replay and keepalive.
+  (Durable Object), with `since` replay and keepalive. Dropping it (or `close()`) closes
+  the socket right away.
 - `download` feature: per-file download with size + SHA-1/SHA-512 verification.
 - `watch` feature: `InstanceWatcher` keeps a live, reconciled instance list (re-fetches on
-  events; a now-hidden instance is dropped = access revocation).
+  events; a now-hidden instance is dropped = access revocation). Receivers wake only when
+  the list changes; dropping the watcher closes its connection.
 
 Requires a Tokio runtime.
 
