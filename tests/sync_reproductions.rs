@@ -1074,3 +1074,151 @@ async fn inspection_rejects_symlink_parents_for_regular_and_override_entries() {
         assert!(!manifest.exists());
     }
 }
+
+/// Serves every connection on its own thread, holding each response briefly so
+/// overlapping downloads are observable. Paths containing "missing" answer 404.
+struct ParallelServer {
+    url: String,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ParallelServer {
+    fn new(body: &'static [u8]) -> Self {
+        use std::sync::atomic::AtomicUsize;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let server_peak = peak.clone();
+        // The listener thread ends with the test process.
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let (active, peak) = (active.clone(), server_peak.clone());
+                thread::spawn(move || {
+                    let mut request = [0; 1024];
+                    let read = stream.read(&mut request).unwrap_or(0);
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(100));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let response = if String::from_utf8_lossy(&request[..read]).contains("missing")
+                    {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    } else {
+                        let mut ok = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        ok.extend_from_slice(body);
+                        ok
+                    };
+                    let _ = stream.write_all(&response);
+                });
+            }
+        });
+        Self { url, peak }
+    }
+
+    fn remote(&self, path: &str, body: &[u8]) -> RemoteFile {
+        use sha2::{Digest, Sha512};
+        RemoteFile {
+            path: Some(path.into()),
+            name: None,
+            size: Some(body.len() as u64),
+            hashes: Some(hostmylauncher::models::Hashes {
+                sha512: Some(hex::encode(Sha512::digest(body))),
+                sha1: None,
+            }),
+            downloads: vec![format!("{}/{path}", self.url)],
+        }
+    }
+}
+
+#[tokio::test]
+async fn sync_and_repair_download_in_parallel_within_the_limit() {
+    let server = ParallelServer::new(b"mod");
+    let files: Vec<_> = (0..6)
+        .map(|index| server.remote(&format!("mods/{index}.jar"), b"mod"))
+        .collect();
+    let client = Client::with_base_url(&server.url)
+        .unwrap()
+        .with_download_concurrency(3);
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+
+    let report = client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(report.downloaded, 6);
+    assert_eq!(server.peak.swap(0, Ordering::SeqCst), 3);
+    for index in 0..6 {
+        assert_eq!(read(root.join(format!("mods/{index}.jar"))), b"mod");
+    }
+
+    for index in 0..6 {
+        std::fs::remove_file(root.join(format!("mods/{index}.jar"))).unwrap();
+    }
+    let repair = client
+        .repair_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(repair.repaired, 6);
+    assert_eq!(server.peak.load(Ordering::SeqCst), 3);
+    let missing: Vec<_> = repair.verification.issues.iter().map(|i| &i.path).collect();
+    let expected: Vec<_> = (0..6).map(|index| format!("mods/{index}.jar")).collect();
+    assert_eq!(missing, expected.iter().collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn one_failed_parallel_download_installs_nothing() {
+    let server = ParallelServer::new(b"mod");
+    let mut files: Vec<_> = (0..5)
+        .map(|index| server.remote(&format!("mods/{index}.jar"), b"mod"))
+        .collect();
+    files.push(server.remote("mods/missing.jar", b"mod"));
+    let client = Client::with_base_url(&server.url)
+        .unwrap()
+        .with_download_concurrency(3);
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("instance");
+    let manifest = sandbox.path().join("manifest.json");
+
+    assert!(client
+        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .await
+        .is_err());
+    assert!(!manifest.exists());
+    // Only the empty root remains; no staged or installed file leaks.
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+/// Hosts run these operations on spawned tasks, which require `Send` futures.
+#[allow(dead_code)]
+fn file_operations_can_run_on_spawned_tasks(client: Client, files: Vec<RemoteFile>) {
+    let path = Path::new("instance");
+    let manifest = Path::new("manifest.json");
+    let (a, b, c) = (client.clone(), client.clone(), client);
+    let (fa, fb, fc) = (files.clone(), files.clone(), files);
+    tokio::spawn(async move { a.sync_instance_files(&fa, path, manifest, |_| {}).await });
+    tokio::spawn(async move { b.verify_instance_files(&fb, path).await });
+    tokio::spawn(async move { c.repair_instance_files(&fc, path, manifest, |_| {}).await });
+}
+
+/// Host tasks often run on 2 MiB stacks in debug builds. Large on-stack buffers
+/// inside these futures once overflowed a spawned bridge operation.
+#[test]
+fn file_operation_futures_stay_small() {
+    let client = Client::with_base_url("http://127.0.0.1:9").unwrap();
+    let (path, manifest) = (Path::new("instance"), Path::new("manifest.json"));
+    let sizes = [
+        std::mem::size_of_val(&client.sync_instance_files(&[], path, manifest, |_| {})),
+        std::mem::size_of_val(&client.verify_instance_files(&[], path)),
+        std::mem::size_of_val(&client.repair_instance_files(&[], path, manifest, |_| {})),
+    ];
+    eprintln!("future sizes: {sizes:?}");
+    assert!(sizes.iter().all(|&size| size < 16 * 1024), "{sizes:?}");
+}

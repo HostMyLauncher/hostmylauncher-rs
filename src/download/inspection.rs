@@ -187,6 +187,7 @@ impl Client {
             installs: Vec::new(),
             downloaded: 0,
         };
+        let mut pending = Vec::new();
         for (path, file) in &regular {
             check_inspection_target(root, path, manifest_target)?;
             let actual = installed_entry(root, path).await?;
@@ -209,10 +210,26 @@ impl Client {
                     continue;
                 }
             }
-            let staged = staging.join("regular").join(path);
-            download_reference(self, file, path, &staged, progress).await?;
+            pending.push((path, file, actual, has_hash));
+        }
+        // Built in a loop, not a `.map` closure, to keep the future `Send`.
+        let mut downloads = Vec::with_capacity(pending.len());
+        for (path, file, actual, has_hash) in pending {
+            downloads.push(async move {
+                let staged = staging.join("regular").join(path);
+                download_reference(self, file, path, &staged, progress).await?;
+                let expected = manifest_file(&staged, file).await?;
+                Ok::<_, Error>((path, staged, actual, has_hash, expected))
+            });
+        }
+        let mut references: Vec<_> = futures::stream::iter(downloads)
+            .buffer_unordered(self.download_concurrency)
+            .try_collect()
+            .await?;
+        // Completion order varies; report and install in path order.
+        references.sort_by(|a, b| a.0.cmp(b.0));
+        for (path, staged, actual, has_hash, expected) in references {
             inspection.downloaded += 1;
-            let expected = manifest_file(&staged, file).await?;
             let matches = actual.as_ref() == Some(&expected);
             if !has_hash {
                 inspection.record(path, actual.as_ref(), matches);

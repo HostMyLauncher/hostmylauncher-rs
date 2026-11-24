@@ -10,9 +10,10 @@ use std::{
     fs::OpenOptions,
     io::{self, Read},
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
@@ -144,45 +145,70 @@ impl Client {
         let mut desired = BTreeMap::new();
         let mut staged_files = Vec::new();
         let total = regular.len() + usize::from(overrides.is_some());
-        let mut downloaded = 0;
-        for (index, (path, file)) in regular.iter().enumerate() {
+        let prepared = AtomicUsize::new(0);
+        let prepare = |path: &Path| {
+            let current = prepared.fetch_add(1, Ordering::Relaxed) + 1;
+            progress(SyncProgress::stage(
+                SyncStage::Install,
+                current,
+                total,
+                path.to_string_lossy().into_owned(),
+            ));
+        };
+        let mut pending = Vec::new();
+        for (path, file) in &regular {
             let target = root.join(path);
             reject_manifest_conflict(&target, &manifest_target)?;
             validate_file_target(&target, &root)?;
             let key = path.to_string_lossy().into_owned();
-            let old = previous.files.get(&key);
-            let entry = if let Some(old) = old.filter(|old| remote_matches(old, file)) {
+            match previous.files.get(&key) {
                 // The manifest describes provider content, not the current disk.
-                old.clone()
-            } else {
-                downloaded += 1;
-                let staged = regular_stage.join(path);
-                if let Some(parent) = staged.parent() {
-                    std::fs::create_dir_all(parent)?;
+                Some(old) if remote_matches(old, file) => {
+                    desired.insert(key, old.clone());
+                    prepare(path);
                 }
-                let progress_ref = &progress;
-                self.download_file(file, &staged, move |downloaded, bytes| {
-                    progress_ref(SyncProgress::download(
+                _ => {
+                    let staged = regular_stage.join(path);
+                    if let Some(parent) = staged.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    pending.push((path, file, staged));
+                }
+            }
+        }
+        // Futures are built in a loop, not a `.map` closure: a closure over these
+        // borrows makes the whole sync future non-`Send` (rust-lang/rust#110338).
+        let mut downloads = Vec::with_capacity(pending.len());
+        for (path, file, staged) in pending {
+            let (progress, prepare) = (&progress, &prepare);
+            downloads.push(async move {
+                self.download_file(file, &staged, |current, bytes| {
+                    progress(SyncProgress::download(
                         path.to_string_lossy().into_owned(),
-                        downloaded,
+                        current,
                         bytes,
                     ));
                 })
                 .await?;
                 let entry = manifest_file(&staged, file).await?;
-                // Without remote hashes, compare verified staging to provider history.
-                if old != Some(&entry) {
-                    staged_files.push((path.clone(), staged));
-                }
-                entry
-            };
+                prepare(path);
+                Ok::<_, Error>((path, staged, entry))
+            });
+        }
+        let mut downloaded_files: Vec<_> = futures::stream::iter(downloads)
+            .buffer_unordered(self.download_concurrency)
+            .try_collect()
+            .await?;
+        // Completion order varies; install in path order.
+        downloaded_files.sort_by(|a, b| a.0.cmp(b.0));
+        let mut downloaded = downloaded_files.len();
+        for (path, staged, entry) in downloaded_files {
+            let key = path.to_string_lossy().into_owned();
+            // Without remote hashes, compare verified staging to provider history.
+            if previous.files.get(&key) != Some(&entry) {
+                staged_files.push((path.clone(), staged));
+            }
             desired.insert(key, entry);
-            progress(SyncProgress::stage(
-                SyncStage::Install,
-                index + 1,
-                total,
-                path.to_string_lossy().into_owned(),
-            ));
         }
 
         if let Some(file) = overrides {
@@ -366,7 +392,8 @@ async fn hash_file(path: &Path) -> Result<(String, String, u64)> {
     let mut sha1 = Sha1::new();
     let mut sha512 = Sha512::new();
     let mut size = 0;
-    let mut buffer = [0u8; 64 * 1024];
+    // Heap buffer: an array would live inside every (concurrent) future state.
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).await?;
         if read == 0 {

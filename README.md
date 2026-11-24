@@ -125,6 +125,18 @@ recovery. The destination root may remain created after a failed first sync, and
 parent directories for a caller-selected external manifest are not rolled back.
 `download_overrides` alone does not provide batch rollback.
 
+### Parallel downloads
+
+Sync, verify and repair download up to 8 instance files at the same time.
+Change the limit with `Client::with_download_concurrency(n)`. Every file is
+still staged and verified before anything is installed, and the batch is applied
+in path order once all downloads succeed: one failed download installs nothing.
+`overrides.zip` is downloaded after the regular files.
+
+Download progress events from different files interleave: each event carries its
+own `path`, and `current`/`total` describe that file only. `Install` events count
+prepared entries (`current` of `total`) in completion order.
+
 Run the regression tests with `cargo test --offline --lib --test sync_reproductions`.
 Symlink tests run on Unix only.
 

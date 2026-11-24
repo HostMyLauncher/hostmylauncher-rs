@@ -13,7 +13,12 @@ pub struct Client {
     pub(crate) http: reqwest::Client,
     pub(crate) base: Url,
     pub(crate) token: Option<String>,
+    #[cfg_attr(not(feature = "download"), allow(dead_code))]
+    pub(crate) download_concurrency: usize,
 }
+
+/// Instance files downloaded at the same time by default.
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 8;
 
 impl Client {
     /// Creates a client for the production API at `https://api.hostmylauncher.com`.
@@ -30,6 +35,7 @@ impl Client {
             http: reqwest::Client::new(),
             base: Url::parse(base_url)?,
             token: None,
+            download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
         })
     }
 
@@ -37,6 +43,14 @@ impl Client {
     /// public endpoints work without it.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    /// How many instance files sync, verify and repair download at the same
+    /// time (default [`DEFAULT_DOWNLOAD_CONCURRENCY`]; values below 1 become 1).
+    /// Each file is still staged and verified before anything is installed.
+    pub fn with_download_concurrency(mut self, files: usize) -> Self {
+        self.download_concurrency = files.max(1);
         self
     }
 
