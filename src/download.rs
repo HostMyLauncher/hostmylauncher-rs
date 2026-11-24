@@ -10,7 +10,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Read},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use futures::{StreamExt, TryStreamExt};
@@ -176,20 +176,15 @@ impl Client {
                 }
             }
         }
+        let bytes = ByteProgress::new(pending.iter().map(|(_, file, _)| **file).chain(overrides));
         // Futures are built in a loop, not a `.map` closure: a closure over these
         // borrows makes the whole sync future non-`Send` (rust-lang/rust#110338).
         let mut downloads = Vec::with_capacity(pending.len());
         for (path, file, staged) in pending {
-            let (progress, prepare) = (&progress, &prepare);
+            let (progress, prepare, bytes) = (&progress, &prepare, &bytes);
             downloads.push(async move {
-                self.download_file(file, &staged, |current, bytes| {
-                    progress(SyncProgress::download(
-                        path.to_string_lossy().into_owned(),
-                        current,
-                        bytes,
-                    ));
-                })
-                .await?;
+                self.download_file(file, &staged, bytes.file(path, progress))
+                    .await?;
                 let entry = manifest_file(&staged, file).await?;
                 prepare(path);
                 Ok::<_, Error>((path, staged, entry))
@@ -214,16 +209,11 @@ impl Client {
         if let Some(file) = overrides {
             downloaded += 1;
             let archive = staging.path().join("overrides.zip");
-            self.download_file(file, &archive, {
-                let progress_ref = &progress;
-                move |downloaded, bytes| {
-                    progress_ref(SyncProgress::download(
-                        "overrides.zip".into(),
-                        downloaded,
-                        bytes,
-                    ));
-                }
-            })
+            self.download_file(
+                file,
+                &archive,
+                bytes.file(Path::new("overrides.zip"), &progress),
+            )
             .await?;
             extract_overrides(&archive, &override_stage)?;
             for path in collect_files(&override_stage)? {
@@ -314,6 +304,10 @@ pub enum SyncStage {
     Remove,
 }
 
+/// Progress of an operation. `Download` events count the bytes downloaded so
+/// far across every file the operation downloads (in parallel) over their
+/// total declared size; `total` is 0 if any of those files has no size.
+/// `path` is the file whose download advanced.
 #[derive(Debug, Clone)]
 pub struct SyncProgress {
     pub stage: SyncStage,
@@ -338,6 +332,48 @@ impl SyncProgress {
             path,
             current: current as u64,
             total: total as u64,
+        }
+    }
+}
+
+/// One byte counter for every download of an operation.
+struct ByteProgress {
+    done: AtomicU64,
+    total: u64,
+}
+
+impl ByteProgress {
+    fn new<'a>(files: impl IntoIterator<Item = &'a RemoteFile>) -> Self {
+        let sizes: Option<Vec<u64>> = files.into_iter().map(|file| file.size).collect();
+        Self {
+            done: AtomicU64::new(0),
+            total: sizes.map_or(0, |sizes| sizes.iter().sum()),
+        }
+    }
+
+    /// `download_file` callback for one file. A retry restarts that file's
+    /// count, so its earlier bytes are taken back out of the total.
+    fn file<'a, F>(
+        &'a self,
+        path: &'a Path,
+        progress: &'a F,
+    ) -> impl Fn(u64, u64) + Send + Sync + 'a
+    where
+        F: Fn(SyncProgress) + Sync,
+    {
+        let counted = AtomicU64::new(0);
+        move |current, _| {
+            let previous = counted.swap(current, Ordering::Relaxed);
+            let done = if current >= previous {
+                self.done.fetch_add(current - previous, Ordering::Relaxed) + (current - previous)
+            } else {
+                self.done.fetch_sub(previous - current, Ordering::Relaxed) - (previous - current)
+            };
+            progress(SyncProgress::download(
+                path.to_string_lossy().into_owned(),
+                done,
+                self.total,
+            ));
         }
     }
 }

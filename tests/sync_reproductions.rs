@@ -8,7 +8,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -1138,6 +1138,21 @@ impl ParallelServer {
 
 #[tokio::test]
 async fn sync_and_repair_download_in_parallel_within_the_limit() {
+    use hostmylauncher::{SyncProgress, SyncStage};
+    // Byte progress covers the whole operation, not each parallel file.
+    let bytes = |events: &Mutex<Vec<SyncProgress>>| -> Vec<(u64, u64)> {
+        let events = events.lock().unwrap();
+        events
+            .iter()
+            .filter(|event| matches!(event.stage, SyncStage::Download))
+            .map(|event| (event.current, event.total))
+            .collect()
+    };
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let record = |events: &Arc<Mutex<Vec<SyncProgress>>>| {
+        let events = events.clone();
+        move |event| events.lock().unwrap().push(event)
+    };
     let server = ParallelServer::new(b"mod");
     let files: Vec<_> = (0..6)
         .map(|index| server.remote(&format!("mods/{index}.jar"), b"mod"))
@@ -1150,10 +1165,15 @@ async fn sync_and_repair_download_in_parallel_within_the_limit() {
     let manifest = sandbox.path().join("manifest.json");
 
     let report = client
-        .sync_instance_files(&files, &root, &manifest, |_| {})
+        .sync_instance_files(&files, &root, &manifest, record(&events))
         .await
         .unwrap();
     assert_eq!(report.downloaded, 6);
+    let synced = bytes(&events);
+    assert!(synced.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    assert!(synced.iter().all(|&(_, total)| total == 18));
+    assert_eq!(synced.last(), Some(&(18, 18)));
+    events.lock().unwrap().clear();
     assert_eq!(server.peak.swap(0, Ordering::SeqCst), 3);
     for index in 0..6 {
         assert_eq!(read(root.join(format!("mods/{index}.jar"))), b"mod");
@@ -1163,10 +1183,11 @@ async fn sync_and_repair_download_in_parallel_within_the_limit() {
         std::fs::remove_file(root.join(format!("mods/{index}.jar"))).unwrap();
     }
     let repair = client
-        .repair_instance_files(&files, &root, &manifest, |_| {})
+        .repair_instance_files(&files, &root, &manifest, record(&events))
         .await
         .unwrap();
     assert_eq!(repair.repaired, 6);
+    assert_eq!(bytes(&events).last(), Some(&(18, 18)));
     assert_eq!(server.peak.load(Ordering::SeqCst), 3);
     let missing: Vec<_> = repair.verification.issues.iter().map(|i| &i.path).collect();
     let expected: Vec<_> = (0..6).map(|index| format!("mods/{index}.jar")).collect();

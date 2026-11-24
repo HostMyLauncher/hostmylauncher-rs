@@ -133,9 +133,11 @@ still staged and verified before anything is installed, and the batch is applied
 in path order once all downloads succeed: one failed download installs nothing.
 `overrides.zip` is downloaded after the regular files.
 
-Download progress events from different files interleave: each event carries its
-own `path`, and `current`/`total` describe that file only. `Install` events count
-prepared entries (`current` of `total`) in completion order.
+`Download` progress covers the whole operation: `current` is the bytes downloaded
+so far across all its files (`overrides.zip` included) and `total` their declared
+size, or 0 if any file has no size. `path` names the file that advanced. A retried
+file starts over, so `current` can go back. `Install` events count prepared
+entries (`current` of `total`) in completion order.
 
 Run the regression tests with `cargo test --offline --lib --test sync_reproductions`.
 Symlink tests run on Unix only.

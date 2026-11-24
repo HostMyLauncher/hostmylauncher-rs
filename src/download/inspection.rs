@@ -212,12 +212,14 @@ impl Client {
             }
             pending.push((path, file, actual, has_hash));
         }
+        let bytes = ByteProgress::new(pending.iter().map(|(_, file, ..)| **file).chain(overrides));
         // Built in a loop, not a `.map` closure, to keep the future `Send`.
         let mut downloads = Vec::with_capacity(pending.len());
         for (path, file, actual, has_hash) in pending {
+            let bytes = &bytes;
             downloads.push(async move {
                 let staged = staging.join("regular").join(path);
-                download_reference(self, file, path, &staged, progress).await?;
+                download_reference(self, file, &staged, bytes.file(path, progress)).await?;
                 let expected = manifest_file(&staged, file).await?;
                 Ok::<_, Error>((path, staged, actual, has_hash, expected))
             });
@@ -243,7 +245,8 @@ impl Client {
         }
         if let Some(file) = overrides {
             let archive = staging.join("overrides.zip");
-            download_reference(self, file, Path::new("overrides.zip"), &archive, progress).await?;
+            let callback = bytes.file(Path::new("overrides.zip"), progress);
+            download_reference(self, file, &archive, callback).await?;
             // download_file prefers SHA512; check every supplied hash too.
             manifest_file(&archive, file).await?;
             inspection.downloaded += 1;
@@ -339,26 +342,14 @@ fn disk_matches_remote(actual: &ManifestFile, remote: &RemoteFile) -> bool {
         })
 }
 
-async fn download_reference<F>(
+async fn download_reference(
     client: &Client,
     remote: &RemoteFile,
-    path: &Path,
     staged: &Path,
-    progress: &F,
-) -> Result<()>
-where
-    F: Fn(SyncProgress) + Send + Sync,
-{
+    progress: impl Fn(u64, u64),
+) -> Result<()> {
     if let Some(parent) = staged.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    client
-        .download_file(remote, staged, |current, total| {
-            progress(SyncProgress::download(
-                path.to_string_lossy().into_owned(),
-                current,
-                total,
-            ));
-        })
-        .await
+    client.download_file(remote, staged, progress).await
 }
