@@ -670,20 +670,30 @@ fn replace_regular_file(staged: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-const MAX_ENTRIES: usize = 10_000;
-const MAX_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
+/// Zip-bomb guard. No fixed size caps: a legit archive can be large (worlds,
+/// FancyMenu animations…), and the provider can already ship any amount of data
+/// as regular files. What a bomb has and real content doesn't is an absurd
+/// compression ratio on a large entry: real large files (images, region files,
+/// archives) barely compress.
+const BOMB_RATIO: u64 = 200;
+const BOMB_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
 
 /// Extracts a previously downloaded `overrides.zip` safely into `destination`.
+///
+/// Refuses paths outside `destination`, symlinks, duplicate entries, entries
+/// that look like a zip bomb and archives that don't fit on the disk. Each
+/// entry is cut at its declared size, so lying headers can't get past these
+/// checks.
 pub fn extract_overrides(archive_path: &Path, destination: &Path) -> Result<()> {
     std::fs::create_dir_all(destination)?;
     let root = std::fs::canonicalize(destination)?;
     let archive_file = std::fs::File::open(archive_path)?;
     let mut archive = ZipArchive::new(archive_file)
         .map_err(|error| Error::Other(format!("invalid overrides.zip: {error}")))?;
-    if archive.len() > MAX_ENTRIES {
-        return Err(Error::Other("overrides.zip has too many entries".into()));
-    }
 
     let mut paths = HashSet::new();
     let mut total_size = 0u64;
@@ -708,16 +718,16 @@ pub fn extract_overrides(archive_path: &Path, destination: &Path) -> Result<()> 
             )));
         }
         let size = entry.size();
-        if size > MAX_FILE_BYTES
-            || total_size
-                .checked_add(size)
-                .is_none_or(|size| size > MAX_UNCOMPRESSED_BYTES)
-        {
-            return Err(Error::Other(
-                "overrides.zip exceeds extraction limits".into(),
-            ));
+        let ratio = size / entry.compressed_size().max(1);
+        if size >= BOMB_MIN_BYTES && ratio > BOMB_RATIO {
+            return Err(Error::Other(format!(
+                "overrides.zip entry {} expands {ratio}x ({} from {}): refusing a likely zip bomb",
+                entry.name(),
+                mib(size),
+                mib(entry.compressed_size())
+            )));
         }
-        total_size += size;
+        total_size = total_size.saturating_add(size);
         let output = root.join(path);
         if !output.starts_with(&root) {
             return Err(Error::Other(format!(
@@ -725,6 +735,16 @@ pub fn extract_overrides(archive_path: &Path, destination: &Path) -> Result<()> 
                 entry.name()
             )));
         }
+    }
+
+    // Fail before writing anything rather than filling the disk halfway.
+    let available = fs4::available_space(&root)?;
+    if total_size > available {
+        return Err(Error::Other(format!(
+            "not enough disk space to extract overrides.zip: needs {}, {} free",
+            mib(total_size),
+            mib(available)
+        )));
     }
 
     let staging = tempfile::tempdir_in(&root)?;
@@ -745,11 +765,15 @@ pub fn extract_overrides(archive_path: &Path, destination: &Path) -> Result<()> 
             .write(true)
             .create_new(true)
             .open(&staged)?;
-        let copied = io::copy(&mut entry.take(MAX_FILE_BYTES + 1), &mut output)?;
-        if copied > MAX_FILE_BYTES {
-            return Err(Error::Other(
-                "overrides.zip entry exceeds extraction limits".into(),
-            ));
+        // Cut at the declared size: the checks above trusted it.
+        let declared = entry.size();
+        let copied = io::copy(&mut entry.take(declared + 1), &mut output)?;
+        if copied > declared {
+            return Err(Error::Other(format!(
+                "overrides.zip entry {} unpacks past its declared size ({})",
+                path.display(),
+                mib(declared)
+            )));
         }
     }
 
@@ -1011,6 +1035,55 @@ mod tests {
         let destination = tempfile::tempdir().unwrap();
         assert!(extract_overrides(zip.path(), destination.path()).is_err());
         assert!(!destination.path().join("../outside.txt").exists());
+    }
+
+    /// Bytes that don't compress (a tiny xorshift: no extra dev-dependency).
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extracts_large_entries_that_dont_compress() {
+        // Like a FancyMenu animation: over the old 128 MiB-per-file cap is fine.
+        let big = noise(BOMB_MIN_BYTES as usize + 1024);
+        let zip = archive(&[("config/fancymenu/assets/animation.fma", &big)]);
+        let destination = tempfile::tempdir().unwrap();
+        extract_overrides(zip.path(), destination.path()).unwrap();
+        let written = std::fs::metadata(
+            destination
+                .path()
+                .join("config/fancymenu/assets/animation.fma"),
+        )
+        .unwrap();
+        assert_eq!(written.len(), big.len() as u64);
+    }
+
+    #[test]
+    fn rejects_a_large_entry_with_a_bomb_ratio() {
+        let zeros = vec![0u8; BOMB_MIN_BYTES as usize + 1024];
+        let zip = archive(&[("bomb.bin", &zeros)]);
+        let destination = tempfile::tempdir().unwrap();
+        let error = extract_overrides(zip.path(), destination.path()).unwrap_err();
+        assert!(error.to_string().contains("zip bomb"), "{error}");
+        assert!(!destination.path().join("bomb.bin").exists());
+    }
+
+    #[test]
+    fn extracts_more_than_ten_thousand_entries() {
+        let names: Vec<String> = (0..10_050).map(|i| format!("config/{i}.txt")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        let zip = archive(&entries);
+        let destination = tempfile::tempdir().unwrap();
+        extract_overrides(zip.path(), destination.path()).unwrap();
+        assert!(destination.path().join("config/10049.txt").exists());
     }
 
     #[test]

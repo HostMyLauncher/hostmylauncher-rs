@@ -11,7 +11,7 @@ categories = ["api-bindings", "web-programming"]
 [features]
 default = ["download"]
 # File download with SHA-1/SHA-512 + size verification.
-download = ["dep:sha1", "dep:sha2", "dep:hex", "dep:tempfile", "dep:zip", "tokio/fs", "tokio/io-util", "reqwest/stream"]
+download = ["dep:sha1", "dep:sha2", "dep:hex", "dep:tempfile", "dep:zip", "dep:fs4", "tokio/fs", "tokio/io-util", "reqwest/stream"]
 # High-level InstanceWatcher that keeps a live, reconciled instance list.
 watch = []
 
@@ -32,6 +32,7 @@ sha2 = { version = "0.10", optional = true }
 hex = { version = "0.4", optional = true }
 tempfile = { version = "3", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+fs4 = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
